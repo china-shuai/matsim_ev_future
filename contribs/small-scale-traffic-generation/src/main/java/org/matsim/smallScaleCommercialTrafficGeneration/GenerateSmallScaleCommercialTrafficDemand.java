@@ -1,0 +1,1151 @@
+/* *********************************************************************** *
+ * project: org.matsim.*
+ * Controller.java
+ *                                                                         *
+ * *********************************************************************** *
+ *                                                                         *
+ * copyright       : (C) 2007 by the members listed in the COPYING,        *
+ *                   LICENSE and WARRANTY file.                            *
+ * email           : info at matsim dot org                                *
+ *                                                                         *
+ * *********************************************************************** *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *   See also COPYING, LICENSE and WARRANTY file                           *
+ *                                                                         *
+ * *********************************************************************** */
+
+package org.matsim.smallScaleCommercialTrafficGeneration;
+
+import com.google.common.collect.Sets;
+import it.unimi.dsi.fastutil.objects.Object2DoubleMap;
+import org.apache.commons.math3.distribution.EnumeratedDistribution;
+import org.apache.commons.math3.random.MersenneTwister;
+import org.apache.commons.math3.random.RandomGenerator;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.geotools.api.feature.simple.SimpleFeature;
+import org.matsim.api.core.v01.Coord;
+import org.matsim.api.core.v01.Id;
+import org.matsim.api.core.v01.Scenario;
+import org.matsim.api.core.v01.network.Link;
+import org.matsim.api.core.v01.network.Network;
+import org.matsim.api.core.v01.population.Activity;
+import org.matsim.application.MATSimAppCommand;
+import org.matsim.application.options.ShpOptions.Index;
+import org.matsim.contrib.roadpricing.*;
+import org.matsim.core.config.Config;
+import org.matsim.core.config.ConfigUtils;
+import org.matsim.core.config.consistency.UnmaterializedConfigGroupChecker;
+import org.matsim.core.config.groups.ReplanningConfigGroup;
+import org.matsim.core.config.groups.ScoringConfigGroup;
+import org.matsim.core.config.groups.VspExperimentalConfigGroup;
+import org.matsim.core.controler.*;
+import org.matsim.core.network.NetworkUtils;
+import org.matsim.core.network.algorithms.TransportModeNetworkFilter;
+import org.matsim.core.population.PopulationUtils;
+import org.matsim.core.replanning.strategies.DefaultPlanStrategiesModule;
+import org.matsim.core.router.TripStructureUtils;
+import org.matsim.core.scenario.ProjectionUtils;
+import org.matsim.core.scenario.ScenarioUtils;
+import org.matsim.core.utils.geometry.CoordUtils;
+import org.matsim.core.utils.geometry.CoordinateTransformation;
+import org.matsim.facilities.ActivityFacility;
+import org.matsim.freight.carriers.*;
+import org.matsim.freight.carriers.analysis.CarriersAnalysis;
+import org.matsim.freight.carriers.controller.*;
+import org.matsim.freight.carriers.usecases.chessboard.CarrierScoringFunctionFactoryImpl;
+import org.matsim.smallScaleCommercialTrafficGeneration.data.CommercialTourSpecifications;
+import org.matsim.smallScaleCommercialTrafficGeneration.data.DefaultTourSpecificationsByUsingKID2002;
+import org.matsim.vehicles.CostInformation;
+import org.matsim.vehicles.Vehicle;
+import org.matsim.vehicles.VehicleType;
+import org.matsim.vehicles.VehicleUtils;
+import picocli.CommandLine;
+
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static org.matsim.core.controler.OutputDirectoryHierarchy.OverwriteFileSetting.overwriteExistingFiles;
+import static org.matsim.smallScaleCommercialTrafficGeneration.SmallScaleCommercialTrafficUtils.readDataDistribution;
+
+/**
+ * Tool to generate small scale commercial traffic for a selected area. The needed input data are: employee information for the area and three shapes files (zones, buildings, landuse). These data should be available with OSM.
+ *
+ * @author Ricardo Ewert
+ */
+@CommandLine.Command(name = "generate-small-scale-commercial-traffic", description = "Generates plans for a small scale commercial traffic model", showDefaultValues = true)
+public class GenerateSmallScaleCommercialTrafficDemand implements MATSimAppCommand {
+	// freight traffic from extern:
+
+	// Option 1: take "as is" from Chengqi code.
+
+	// Option 2: differentiate FTL and LTL by Gütergruppe.  FTL as in option 1.  LTL per Gütergruppe _ein_ Ziel in Zone, = "Hub".  Verteilverkehr
+	// von dort.  Startseite genauso.
+
+	// Option 3: Leerkamp (nur in RVR Modell).
+
+	private static final Logger log = LogManager.getLogger(GenerateSmallScaleCommercialTrafficDemand.class);
+	private final IntegrateExistingTrafficToSmallScaleCommercial integrateExistingTrafficToSmallScaleCommercial;
+	private final CommercialTourSpecifications commercialTourSpecifications;
+	protected final VehicleSelection vehicleSelection;
+	private final UnhandledServicesSolution unhandledServicesSolution;
+
+	private enum CreationOption {
+		useExistingCarrierFileWithSolution, createNewCarrierFile, useExistingCarrierFileWithoutSolution
+	}
+
+	public enum SmallScaleCommercialTrafficType {
+		commercialPersonTraffic, goodsTraffic, completeSmallScaleCommercialTraffic
+	}
+
+	@CommandLine.Parameters(arity = "1", paramLabel = "INPUT", description = "Path to the config for small scale commercial generation")
+	private Path configPath;
+
+	@CommandLine.Option(names = "--pathToDataDistributionToZones", description = "Path to the data distribution to zones")
+	private Path pathToDataDistributionToZones;
+
+	@CommandLine.Option(names = "--pathToCommercialFacilities", description = "Path to the commercial facilities.")
+	private Path pathToCommercialFacilities;
+
+	@CommandLine.Option(names = "--carrierFilePath", description = "Path to the carrier file.")
+	private Path carrierFilePath;
+
+	@CommandLine.Option(names = "--sample", description = "Scaling factor of the small scale commercial traffic (0, 1)", required = true)
+	private double sample;
+
+	@CommandLine.Option(names = "--jspritIterations", description = "Set number of jsprit iterations", required = true)
+	private int jspritIterations;
+
+	@CommandLine.Option(names = "--additionalTravelBufferPerIterationInMinutes", description = "This buffer/driving time is used for service-route-planning. If set too low, carriers may not serve all their services.", defaultValue = "30")
+	private int additionalTravelBufferPerIterationInMinutes;
+
+	@CommandLine.Option(names = "--maxReplanningIterations", description = "Limit of carrier replanning iterations, where carriers with unhandled services get new plans. If your carrier-plans are still not fully served, increase this limit.", defaultValue = "100")
+	private int maxReplanningIterations;
+
+	@CommandLine.Option(names = "--creationOption", description = "Set option of mode differentiation:  useExistingCarrierFileWithSolution, createNewCarrierFile, useExistingCarrierFileWithoutSolution")
+	private CreationOption usedCreationOption;
+
+	@CommandLine.Option(names = "--smallScaleCommercialTrafficType", description = "Select traffic type. Options: commercialPersonTraffic, goodsTraffic, completeSmallScaleCommercialTraffic (contains both types)")
+	private SmallScaleCommercialTrafficType usedSmallScaleCommercialTrafficType;
+
+	@CommandLine.Option(names = "--includeExistingModels", description = "If models for some segments exist they can be included.")
+	private boolean includeExistingModels;
+
+	@CommandLine.Option(names = "--zoneShapeFileName", description = "Path of the zone shape file.")
+	private Path shapeFileZonePath;
+
+	@CommandLine.Option(names = "--zoneShapeFileNameColumn", description = "Name of the unique column of the name/Id of each zone in the zones shape file.")
+	private String shapeFileZoneNameColumn;
+
+	@CommandLine.Option(names = "--shapeCRS", description = "CRS of the three input shape files (zones, landuse, buildings")
+	private String shapeCRS;
+
+	@CommandLine.Option(names = "--resistanceFactor_commercialPersonTraffic", description = "ResistanceFactor for the trip distribution")
+	private double resistanceFactor_commercialPersonTraffic;
+
+	@CommandLine.Option(names = "--resistanceFactor_goodsTraffic", description = "ResistanceFactor for the trip distribution")
+	private double resistanceFactor_goodsTraffic;
+
+	@CommandLine.Option(names = "--nameOutputPopulation", description = "Name of the output Population")
+	private String nameOutputPopulation;
+
+	@CommandLine.Option(names = "--numberOfPlanVariantsPerAgent", description = "If an agent should have variant plans, you should set this parameter.", defaultValue = "1")
+	private int numberOfPlanVariantsPerAgent;
+
+	@CommandLine.Option(names = "--network", description = "Overwrite network file in config")
+	private String network;
+
+	@CommandLine.Option(names = "--pathOutput", description = "Path for the output")
+	private Path output;
+
+	@CommandLine.Option(names = "--MATSimIterationsAfterDemandGeneration", description = "If selected, the MATSim simulation will be run for the selected number of iterations after demand generation. if not selected, only demand generation is performed.")
+	private Integer MATSimIterationsAfterDemandGeneration;
+
+	private Random rnd;
+	private RandomGenerator rng;
+	private final Map<String, Map<String, List<ActivityFacility>>> facilitiesPerZone = new HashMap<>();
+	private final Map<Id<Carrier>, CarrierAttributes> carrierId2carrierAttributes = new HashMap<>();
+	private final Map<SmallScaleCommercialTrafficType, Double> resistanceFactorsPerModelType = new HashMap<>();
+
+	private Map<SmallScaleCommercialTrafficType, EnumeratedDistribution<TourStartAndDuration>> tourDistribution = null;
+	private Map<ServiceDurationPerCategoryKey, EnumeratedDistribution<DurationsBounds>> serviceDurationTimeSelector = null;
+
+	private TripDistributionMatrix odMatrix;
+	private Map<String, Object2DoubleMap<String>> resultingDataPerZone;
+	private Map<String, Map<Id<Link>, Link>> linksPerZone;
+
+	private Index indexZones;
+
+	public GenerateSmallScaleCommercialTrafficDemand() {
+		this.integrateExistingTrafficToSmallScaleCommercial = new DefaultIntegrateExistingTrafficToSmallScaleCommercialImpl();
+		log.info("Using default {} if existing models are integrated!", DefaultIntegrateExistingTrafficToSmallScaleCommercialImpl.class.getSimpleName());
+		this.commercialTourSpecifications = new DefaultTourSpecificationsByUsingKID2002();
+		log.info("Using default {} for tour specifications!", DefaultTourSpecificationsByUsingKID2002.class.getSimpleName());
+		this.vehicleSelection = new DefaultVehicleSelection();
+		log.info("Using default {} for tour vehicle-selection!", DefaultVehicleSelection.class.getSimpleName());
+		this.unhandledServicesSolution = new DefaultUnhandledServicesSolution(this);
+		log.info("Using default {} for tour unhandled-services-solution!", DefaultUnhandledServicesSolution.class.getSimpleName());
+	}
+
+	public GenerateSmallScaleCommercialTrafficDemand(IntegrateExistingTrafficToSmallScaleCommercial integrateExistingTrafficToSmallScaleCommercial, CommercialTourSpecifications getCommercialTourSpecifications, VehicleSelection vehicleSelection, UnhandledServicesSolution unhandledServicesSolution) {
+		if (integrateExistingTrafficToSmallScaleCommercial == null){
+			this.integrateExistingTrafficToSmallScaleCommercial = new DefaultIntegrateExistingTrafficToSmallScaleCommercialImpl();
+			log.info("Using default {} if existing models are integrated!", DefaultIntegrateExistingTrafficToSmallScaleCommercialImpl.class.getSimpleName());
+		} else {
+			this.integrateExistingTrafficToSmallScaleCommercial = integrateExistingTrafficToSmallScaleCommercial;
+			log.info("Using {} if existing models are integrated!", integrateExistingTrafficToSmallScaleCommercial.getClass().getSimpleName());
+		}
+		if (getCommercialTourSpecifications == null){
+			this.commercialTourSpecifications = new DefaultTourSpecificationsByUsingKID2002();
+			log.info("Using default {} for tour specifications!", DefaultTourSpecificationsByUsingKID2002.class.getSimpleName());
+		} else {
+			this.commercialTourSpecifications = getCommercialTourSpecifications;
+			log.info("Using {} for tour specifications!", getCommercialTourSpecifications.getClass().getSimpleName());
+		}
+		if (vehicleSelection == null){
+			this.vehicleSelection = new DefaultVehicleSelection();
+			log.info("Using default {} for tour vehicle-selection!", DefaultVehicleSelection.class.getSimpleName());
+		} else {
+			this.vehicleSelection = vehicleSelection;
+			log.info("Using {} for tour vehicle-selection!", vehicleSelection.getClass().getSimpleName());
+		}
+		if (unhandledServicesSolution == null){
+			this.unhandledServicesSolution = new DefaultUnhandledServicesSolution(this);
+			log.info("Using default {} for unhandled-services-solution", DefaultUnhandledServicesSolution.class.getSimpleName());
+		} else {
+			this.unhandledServicesSolution = unhandledServicesSolution;
+			log.info("Using {} for unhandled-services-solution!", unhandledServicesSolution.getClass().getSimpleName());
+		}
+	}
+
+	public static void main(String[] args) {
+		System.exit(new CommandLine(new GenerateSmallScaleCommercialTrafficDemand()).execute(args));
+	}
+
+	@Override
+	public Integer call() throws Exception {
+		Configurator.setLevel("org.matsim.core.utils.geometry.geotools.MGC", Level.ERROR);
+
+		String modelName = configPath.getParent().getFileName().toString();
+
+		String sampleName = SmallScaleCommercialTrafficUtils.getSampleNameOfOutputFolder(sample);
+
+		Config config = readAndCheckConfig(configPath, modelName, sampleName, output);
+
+		output = Path.of(config.controller().getOutputDirectory());
+
+		FreightCarriersConfigGroup freightCarriersConfigGroup = ConfigUtils.addOrGetModule(config, FreightCarriersConfigGroup.class);
+		if (freightCarriersConfigGroup.getCarriersVehicleTypesFile() != null)
+			config.vehicles().setVehiclesFile(freightCarriersConfigGroup.getCarriersVehicleTypesFile());
+
+		Scenario scenario = ScenarioUtils.loadScenario(config);
+
+		resultingDataPerZone = readDataDistribution(pathToDataDistributionToZones);
+		serviceDurationTimeSelector = commercialTourSpecifications.createStopDurationDistributionPerCategory(rng);
+		tourDistribution = commercialTourSpecifications.createTourDistribution(rng);
+
+		if ((usedSmallScaleCommercialTrafficType == SmallScaleCommercialTrafficType.commercialPersonTraffic || usedSmallScaleCommercialTrafficType == SmallScaleCommercialTrafficType.completeSmallScaleCommercialTraffic) && resistanceFactor_commercialPersonTraffic == 0.)
+			throw new Exception("You selected commercialPersonTraffic but did not set a resistanceFactor_commercialPersonTraffic. Please set it.");
+		if ((usedSmallScaleCommercialTrafficType == SmallScaleCommercialTrafficType.goodsTraffic || usedSmallScaleCommercialTrafficType == SmallScaleCommercialTrafficType.completeSmallScaleCommercialTraffic) && resistanceFactor_goodsTraffic == 0.)
+			throw new Exception("You selected goodsTraffic but did not set a resistanceFactor_goodsTraffic > 0. Please set it.");
+
+		resistanceFactorsPerModelType.put(SmallScaleCommercialTrafficType.commercialPersonTraffic, resistanceFactor_commercialPersonTraffic);
+		resistanceFactorsPerModelType.put(SmallScaleCommercialTrafficType.goodsTraffic, resistanceFactor_goodsTraffic);
+		log.info("Set resistance factor for commercialPersonTraffic to {} and for goodsTraffic to {}.", resistanceFactor_commercialPersonTraffic, resistanceFactor_goodsTraffic);
+
+		switch (usedCreationOption) {
+			case useExistingCarrierFileWithSolution, useExistingCarrierFileWithoutSolution -> {
+				log.info("Existing carriers (including carrier vehicle types) should be set in the freight config group");
+				if (includeExistingModels)
+					throw new Exception(
+						"You set that existing models should included to the new model. This is only possible for a creation of the new carrier file and not by using an existing.");
+				if (freightCarriersConfigGroup.getCarriersFile() == null)
+					freightCarriersConfigGroup.setCarriersFile(carrierFilePath.toString());
+				if (config.vehicles() != null && freightCarriersConfigGroup.getCarriersVehicleTypesFile() == null)
+					freightCarriersConfigGroup.setCarriersVehicleTypesFile(config.vehicles().getVehiclesFile());
+				log.info("Load carriers from: {}", freightCarriersConfigGroup.getCarriersFile());
+				CarriersUtils.loadCarriersAccordingToFreightConfig(scenario);
+
+				// Remove vehicle types which are not used by the carriers
+				Map<Id<VehicleType>, VehicleType> readVehicleTypes = CarriersUtils.getOrAddCarrierVehicleTypes(scenario).getVehicleTypes();
+				List<Id<VehicleType>> usedCarrierVehicleTypes = CarriersUtils.getCarriers(scenario).getCarriers().values().stream()
+					.flatMap(carrier -> carrier.getCarrierCapabilities().getCarrierVehicles().values().stream())
+					.map(vehicle -> vehicle.getType().getId())
+					.distinct()
+					.toList();
+
+				readVehicleTypes.keySet().removeIf(vehicleType -> !usedCarrierVehicleTypes.contains(vehicleType));
+
+				if (Objects.requireNonNull(usedCreationOption) == CreationOption.useExistingCarrierFileWithoutSolution) {
+					solveSeparatedVRPs(scenario);
+				}
+			}
+			default -> {
+				if (!Files.exists(shapeFileZonePath)) {
+					throw new Exception("Required districts shape file {} not found" + shapeFileZonePath.toString());
+				}
+				indexZones = SmallScaleCommercialTrafficUtils.getIndexZones(shapeFileZonePath, shapeCRS, shapeFileZoneNameColumn);
+
+				filterFacilitiesForZones(scenario, facilitiesPerZone);
+
+				switch (usedSmallScaleCommercialTrafficType) {
+					case commercialPersonTraffic, goodsTraffic -> createCarriersAndDemand(output, scenario,
+						usedSmallScaleCommercialTrafficType,
+						includeExistingModels, indexZones);
+					case completeSmallScaleCommercialTraffic -> {
+						createCarriersAndDemand(output, scenario, SmallScaleCommercialTrafficType.commercialPersonTraffic,
+							includeExistingModels, indexZones);
+						createCarriersAndDemand(output, scenario, SmallScaleCommercialTrafficType.goodsTraffic,
+							false, indexZones);
+					}
+					default -> throw new RuntimeException("No traffic type selected.");
+				}
+				CarriersUtils.writeCarriers(scenario, "output_carriers_noPlans.xml.gz");
+				solveSeparatedVRPs(scenario);
+			}
+		}
+		CarriersAnalysis carriersAnalysis = new CarriersAnalysis(CarriersUtils.addOrGetCarriers(scenario), output.resolve("analysis").resolve("freight").toString());
+		carriersAnalysis.runCarrierAnalysis(CarriersAnalysis.CarrierAnalysisType.carriersPlans);
+
+		CarriersUtils.writeCarriers(scenario, "output_carriers_withPlans.xml.gz");
+
+		SmallScaleCommercialTrafficUtils.createPlansBasedOnCarrierPlans(scenario,
+			usedSmallScaleCommercialTrafficType, output, modelName, sampleName, nameOutputPopulation, numberOfPlanVariantsPerAgent);
+
+		if (MATSimIterationsAfterDemandGeneration!= null && MATSimIterationsAfterDemandGeneration >= 0) {
+			log.info("Running MATSim for {} iterations after demand generation.", MATSimIterationsAfterDemandGeneration);
+			Carriers carriers = CarriersUtils.addOrGetCarriers(scenario);
+			carriers.getCarriers().clear();
+
+			//this is necessary because integrated existing models can have additional vehicleTypes
+			CarriersUtils.getOrAddCarrierVehicleTypes(scenario).getVehicleTypes().values().forEach(vehicleType -> {
+				log.info("Adding vehicle type {} to scenario vehicles.", vehicleType.getId());
+				if (!scenario.getVehicles().getVehicleTypes().containsKey(vehicleType.getId()))
+					scenario.getVehicles().addVehicleType(vehicleType);
+			});
+			Set<String> activityTypes = new HashSet<>(
+			    scenario.getPopulation().getPersons().values().stream()
+				.flatMap(person -> PopulationUtils.getActivities(person.getSelectedPlan(),
+					TripStructureUtils.StageActivityHandling.ExcludeStageActivities).stream())
+			        .map(Activity::getType)
+			        .toList()
+			);
+			for (String activityType : activityTypes) {
+				config.scoring().addActivityParams(new ScoringConfigGroup.ActivityParams(activityType).setTypicalDuration(30 * 60));
+			}
+			List<String> subpopulations = scenario.getPopulation().getPersons().values().stream()
+				.map(PopulationUtils::getSubpopulation)
+				.filter(Objects::nonNull)
+				.toList();
+
+			subpopulations.forEach(subpopulation -> {
+				config.replanning().addStrategySettings(
+					new ReplanningConfigGroup.StrategySettings().setStrategyName(DefaultPlanStrategiesModule.DefaultSelector.ChangeExpBeta).setWeight(
+						0.85).setSubpopulation(subpopulation));
+
+				config.replanning().addStrategySettings(
+					new ReplanningConfigGroup.StrategySettings().setStrategyName(DefaultPlanStrategiesModule.DefaultStrategy.ReRoute).setWeight(
+						0.1).setSubpopulation(subpopulation));
+			});
+
+			Set<String> modes = scenario.getVehicles().getVehicleTypes().values().stream()
+				.map(vehicleType -> vehicleType.getId().toString())
+				.distinct().collect(Collectors.toSet());
+
+			modes.forEach(mode -> {
+				ScoringConfigGroup.ModeParams thisModeParams = new ScoringConfigGroup.ModeParams(mode);
+				config.scoring().addModeParams(thisModeParams);
+			});
+
+			Set<String> qsimModes = new HashSet<>(config.qsim().getMainModes());
+			config.qsim().setMainModes(Sets.union(qsimModes, modes));
+
+			Set<String> networkModes = new HashSet<>(config.routing().getNetworkModes());
+			config.routing().setNetworkModes(Sets.union(networkModes, modes));
+
+//			sw.getConfigGroup().defaultParams().setShp(null);
+//			sw.getConfigGroup().setDefaultDashboards(SimWrapperConfigGroup.Mode.disabled);
+//			sw.addDashboard(new OverviewDashboard());
+//			sw.addDashboard(new CarrierDashboard());
+//			sw.addDashboard(new TripDashboard().setGroupsOfSubpopulationsForCommercialAnalysis("smallScaleGoodsTraffic=goodsTraffic").setAnalysisArgs("--shp-filter", "none"));
+//			sw.addDashboard(new CommercialTrafficDashboard(config.global().getCoordinateSystem()).setGroupsOfSubpopulationsForCommercialAnalysis("smallScaleGoodsTraffic=goodsTraffic"));
+//			sw.addDashboard(new TripDashboard().setGroupsOfSubpopulationsForCommercialAnalysis("commercialPersonTraffic=commercialPersonTraffic,commercialPersonTraffic_service;smallScaleGoodsTraffic=goodsTraffic").setAnalysisArgs("--shp-filter", "none"));
+// 			sw.addDashboard(new CommercialTrafficDashboard(config.global().getCoordinateSystem()).setGroupsOfSubpopulationsForCommercialAnalysis("commercialPersonTraffic=commercialPersonTraffic,commercialPersonTraffic_service;smallScaleGoodsTraffic=goodsTraffic"));
+			Controller controller = prepareController(scenario);
+
+			if (!RoadPricingUtils.addOrGetRoadPricingScheme(scenario).getTolledLinkIds().isEmpty()) {
+				controller.addOverridingModule( new RoadPricingModule(RoadPricingUtils.addOrGetRoadPricingScheme(scenario)) );
+			}
+//			controller.addOverridingModule(new SimWrapperModule(sw));
+
+			// Creating inject always adds check for unmaterialized config groups.
+			controller.getInjector();
+
+			// Removes check after injector has been created
+			controller.getConfig().removeConfigConsistencyChecker(UnmaterializedConfigGroupChecker.class);
+
+			controller.run();
+		}
+		return 0;
+	}
+
+	/**
+	 * Creates a map with the different facility types per building.
+	 * @param scenario 				complete Scenario
+	 * @param facilitiesPerZone 	Map with facilities per zone
+	 */
+	private void filterFacilitiesForZones(Scenario scenario, Map<String, Map<String, List<ActivityFacility>>> facilitiesPerZone) {
+		scenario.getActivityFacilities().getFacilities().values().forEach((activityFacility -> {
+			activityFacility.getActivityOptions().values().forEach(activityOption -> facilitiesPerZone.computeIfAbsent((String) activityFacility.getAttributes().getAttribute("zone"), k -> new HashMap<>())
+				.computeIfAbsent(activityOption.getType(), k -> new ArrayList<>()).add(activityFacility));
+		}));
+	}
+
+	/**
+	 * Solves the generated carrier-plans and puts them into the Scenario.
+	 * If a carrier has unhandled services, a carrier-replanning loop deletes the old plans and generates new plans.
+	 * The new plans will then be solved and checked again.
+	 * This is repeated until the carrier-plans are solved or the {@code maxReplanningIterations} are reached.
+	 * @param originalScenario complete Scenario
+	 */
+	private void solveSeparatedVRPs(Scenario originalScenario) throws Exception {
+
+		CarriersUtils.addRoadPricingForVRPToEnsureSolutionsBasedOnNetworkModes(originalScenario);
+
+		boolean splitCarrier = true;
+		boolean splitVRPs = false;
+		int maxServicesPerCarrier = 100;
+		Map<Id<Carrier>, Carrier> allCarriers = new HashMap<>(
+			CarriersUtils.getCarriers(originalScenario).getCarriers());
+		Map<Id<Carrier>, Carrier> solvedCarriers = new HashMap<>();
+		List<Id<Carrier>> keyList = new ArrayList<>(allCarriers.keySet());
+		Map<Id<Carrier>, List<Id<Carrier>>> carrierId2subCarrierIds = new HashMap<>();
+		CarriersUtils.getCarriers(originalScenario).getCarriers().values().forEach(carrier -> {
+			if (CarriersUtils.getJspritIterations(carrier) == 0) {
+				allCarriers.remove(carrier.getId());
+				solvedCarriers.put(carrier.getId(), carrier);
+			}
+		});
+		int carrierSteps = 30;
+		for (int i = 0; i < allCarriers.size(); i++) {
+			int fromIndex = i * carrierSteps;
+			int toIndex = (i + 1) * carrierSteps;
+			if (toIndex >= allCarriers.size())
+				toIndex = allCarriers.size();
+
+			Map<Id<Carrier>, Carrier> subCarriers = new HashMap<>(allCarriers);
+			List<Id<Carrier>> subList;
+			if (splitVRPs) {
+				subList = keyList.subList(fromIndex, toIndex);
+				subCarriers.keySet().retainAll(subList);
+			} else {
+				fromIndex = 0;
+				toIndex = allCarriers.size();
+			}
+
+			if (splitCarrier) {
+				Map<Id<Carrier>, Carrier> subCarriersToAdd = new HashMap<>();
+				List<Id<Carrier>> keyListCarrierToRemove = new ArrayList<>();
+				for (Carrier carrier : subCarriers.values()) {
+
+					int countedServices = 0;
+					int countedVehicles = 0;
+					if (carrier.getServices().size() > maxServicesPerCarrier) {
+
+						int numberOfNewCarrier = (int) Math
+							.ceil((double) carrier.getServices().size() / (double) maxServicesPerCarrier);
+						int numberOfServicesPerNewCarrier = Math
+							.round((float) carrier.getServices().size() / numberOfNewCarrier);
+
+						int j = 0;
+						while (j < numberOfNewCarrier) {
+
+							int numberOfServicesForNewCarrier = numberOfServicesPerNewCarrier;
+							int numberOfVehiclesForNewCarrier = numberOfServicesPerNewCarrier;
+							if (j + 1 == numberOfNewCarrier) {
+								numberOfServicesForNewCarrier = carrier.getServices().size() - countedServices;
+								numberOfVehiclesForNewCarrier = carrier.getCarrierCapabilities().getCarrierVehicles()
+									.size() - countedVehicles;
+							}
+							Carrier newCarrier = CarriersUtils.createCarrier(
+								Id.create(carrier.getId().toString() + "_part_" + (j + 1), Carrier.class));
+							CarrierCapabilities newCarrierCapabilities = CarrierCapabilities.Builder.newInstance()
+								.setFleetSize(carrier.getCarrierCapabilities().getFleetSize()).build();
+							newCarrierCapabilities.getCarrierVehicles()
+								.putAll(carrier.getCarrierCapabilities().getCarrierVehicles());
+							newCarrier.setCarrierCapabilities(newCarrierCapabilities);
+							newCarrier.getServices().putAll(carrier.getServices());
+							CarriersUtils.setJspritIterations(newCarrier, CarriersUtils.getJspritIterations(carrier));
+							carrier.getAttributes().getAsMap().keySet().forEach(attribute -> newCarrier.getAttributes()
+								.putAttribute(attribute, carrier.getAttributes().getAttribute(attribute)));
+
+							carrierId2subCarrierIds.putIfAbsent(carrier.getId(), new LinkedList<>());
+							carrierId2subCarrierIds.get(carrier.getId()).add(newCarrier.getId());
+
+							List<Id<Vehicle>> vehiclesForNewCarrier = new ArrayList<>(
+								carrier.getCarrierCapabilities().getCarrierVehicles().keySet());
+							List<Id<CarrierService>> servicesForNewCarrier = new ArrayList<>(
+								carrier.getServices().keySet());
+
+							List<Id<Vehicle>> subListVehicles = vehiclesForNewCarrier.subList(
+								j * numberOfServicesPerNewCarrier,
+								j * numberOfServicesPerNewCarrier + numberOfVehiclesForNewCarrier);
+							List<Id<CarrierService>> subListServices = servicesForNewCarrier.subList(
+								j * numberOfServicesPerNewCarrier,
+								j * numberOfServicesPerNewCarrier + numberOfServicesForNewCarrier);
+
+							newCarrier.getCarrierCapabilities().getCarrierVehicles().keySet()
+								.retainAll(subListVehicles);
+							newCarrier.getServices().keySet().retainAll(subListServices);
+
+							countedVehicles += newCarrier.getCarrierCapabilities().getCarrierVehicles().size();
+							countedServices += newCarrier.getServices().size();
+
+							subCarriersToAdd.put(newCarrier.getId(), newCarrier);
+							j++;
+						}
+						keyListCarrierToRemove.add(carrier.getId());
+						if (countedVehicles != carrier.getCarrierCapabilities().getCarrierVehicles().size())
+							throw new Exception("Split parts of the carrier " + carrier.getId().toString()
+								+ " has a different number of vehicles than the original carrier");
+						if (countedServices != carrier.getServices().size())
+							throw new Exception("Split parts of the carrier " + carrier.getId().toString()
+								+ " has a different number of services than the original carrier");
+
+					}
+				}
+				subCarriers.putAll(subCarriersToAdd);
+				for (Id<Carrier> id : keyListCarrierToRemove) {
+					subCarriers.remove(id);
+				}
+			}
+			CarriersUtils.getCarriers(originalScenario).getCarriers().clear();
+			CarriersUtils.getCarriers(originalScenario).getCarriers().putAll(subCarriers);
+
+//			Map the values to the new subcarriers
+			for (Id<Carrier> oldCarrierId : carrierId2subCarrierIds.keySet()) {
+				for (Id<Carrier> newCarrierId : carrierId2subCarrierIds.get(oldCarrierId)) {
+					if (carrierId2carrierAttributes.putIfAbsent(newCarrierId, carrierId2carrierAttributes.get(oldCarrierId)) != null)
+						throw new Exception("CarrierAttributes already exist for the carrier " + newCarrierId.toString());
+				}
+			}
+
+			log.info("Solving carriers {}-{} of all {} carriers. This are {} VRP to solve.", fromIndex + 1, toIndex, allCarriers.size(),
+				subCarriers.size());
+			CarriersUtils.runJsprit(originalScenario, CarriersUtils.CarrierSelectionForSolution.solveOnlyForCarrierWithoutPlans);
+			List<Carrier> nonCompleteSolvedCarriers = CarriersUtils.createListOfCarrierWithUnhandledJobs(CarriersUtils.getCarriers(originalScenario));
+			if (!nonCompleteSolvedCarriers.isEmpty() && maxReplanningIterations > 0) {
+				CarriersUtils.writeCarriers(CarriersUtils.getCarriers(originalScenario), originalScenario.getConfig().controller().getOutputDirectory() + "/" + originalScenario.getConfig().controller().getRunId() + ".output_carriers_notCompletelySolved.xml.gz");
+				unhandledServicesSolution.tryToSolveAllCarriersCompletely(originalScenario, nonCompleteSolvedCarriers);
+			}
+			solvedCarriers.putAll(CarriersUtils.getCarriers(originalScenario).getCarriers());
+			CarriersUtils.getCarriers(originalScenario).getCarriers().clear();
+			if (!splitVRPs)
+				break;
+		}
+		CarriersUtils.getCarriers(originalScenario).getCarriers().putAll(solvedCarriers);
+		CarriersUtils.getCarriers(originalScenario).getCarriers().values().forEach(carrier -> {
+			if (linksPerZone != null && !carrier.getAttributes().getAsMap().containsKey("tourStartArea")) {
+				List<String> startAreas = new ArrayList<>();
+				for (ScheduledTour tour : carrier.getSelectedPlan().getScheduledTours()) {
+					String tourStartZone = SmallScaleCommercialTrafficUtils
+						.findZoneOfLink(tour.getTour().getStartLinkId(), linksPerZone);
+					if (!startAreas.contains(tourStartZone))
+						startAreas.add(tourStartZone);
+				}
+				carrier.getAttributes().putAttribute("tourStartArea",
+					String.join(";", startAreas));
+			}
+		});
+	}
+
+	private void createCarriersAndDemand(Path output, Scenario scenario,
+										 SmallScaleCommercialTrafficType smallScaleCommercialTrafficType,
+										 boolean includeExistingModels, Index indexZones) throws Exception {
+		ArrayList<String> modesORvehTypes;
+		if (smallScaleCommercialTrafficType.equals(SmallScaleCommercialTrafficType.goodsTraffic))
+			modesORvehTypes = new ArrayList<>(
+				Arrays.asList("vehTyp1", "vehTyp2", "vehTyp3", "vehTyp4", "vehTyp5"));
+		else if (smallScaleCommercialTrafficType.equals(SmallScaleCommercialTrafficType.commercialPersonTraffic))
+			modesORvehTypes = new ArrayList<>(List.of("total"));
+		else
+			throw new Exception("Invalid traffic type selected!");
+
+		TrafficVolumeGeneration.setInputParameters(smallScaleCommercialTrafficType);
+
+		Map<TrafficVolumeGeneration.TrafficVolumeKey, Object2DoubleMap<Integer>> trafficVolumePerTypeAndZone_start = TrafficVolumeGeneration
+			.createTrafficVolume_start(resultingDataPerZone, output, sample, modesORvehTypes, smallScaleCommercialTrafficType);
+		Map<TrafficVolumeGeneration.TrafficVolumeKey, Object2DoubleMap<Integer>> trafficVolumePerTypeAndZone_stop = TrafficVolumeGeneration
+			.createTrafficVolume_stop(resultingDataPerZone, output, sample, modesORvehTypes, smallScaleCommercialTrafficType);
+
+		if (includeExistingModels) {
+			integrateExistingTrafficToSmallScaleCommercial.readExistingCarriersFromFolder(scenario, sample, indexZones);
+			integrateExistingTrafficToSmallScaleCommercial.reduceDemandBasedOnExistingCarriers(scenario, indexZones, smallScaleCommercialTrafficType,
+				trafficVolumePerTypeAndZone_start, trafficVolumePerTypeAndZone_stop);
+		}
+
+		prepareConfigForResultingModes(scenario);
+		NetworkUtils.cleanNetwork(scenario.getNetwork(), (Set<String>) scenario.getConfig().qsim().getMainModes());
+		if (linksPerZone == null)
+			linksPerZone = filterLinksForZones(scenario, this.indexZones, facilitiesPerZone, shapeFileZoneNameColumn);
+
+		odMatrix = createTripDistribution(trafficVolumePerTypeAndZone_start,
+			trafficVolumePerTypeAndZone_stop, smallScaleCommercialTrafficType, scenario, output);
+		createCarriers(scenario, smallScaleCommercialTrafficType);
+	}
+
+	/**
+	 * This method prepares the config to include all resulting modes from the vehicle types.
+	 * This done so late, because only after adding existing carriers the used vehicle types and modes are known.
+	 *
+	 * @param scenario scenario
+	 */
+	private static void prepareConfigForResultingModes(Scenario scenario) {
+		Set<String> modes = scenario.getVehicles().getVehicleTypes().values().stream()
+			.map(VehicleType::getNetworkMode).collect(Collectors.toSet());
+
+		modes.forEach(mode -> {
+			ScoringConfigGroup.ModeParams thisModeParams = new ScoringConfigGroup.ModeParams(mode);
+			scenario.getConfig().scoring().addModeParams(thisModeParams);
+		});
+
+		Set<String> qsimModes = new HashSet<>(scenario.getConfig().qsim().getMainModes());
+		scenario.getConfig().qsim().setMainModes(Sets.union(qsimModes, modes));
+
+		Set<String> networkModes = new HashSet<>(scenario.getConfig().routing().getNetworkModes());
+		scenario.getConfig().routing().setNetworkModes(Sets.union(networkModes, modes));
+	}
+
+	/**
+	 * Reads and checks config if all necessary parameters are set.
+	 */
+	private Config readAndCheckConfig(Path configPath, String modelName, String sampleName, Path output) throws Exception {
+		Config config = ConfigUtils.loadConfig(configPath.toString());
+		if (output == null || output.toString().isEmpty())
+			config.controller().setOutputDirectory(Path.of(config.controller().getOutputDirectory()).resolve(modelName)
+				.resolve(usedSmallScaleCommercialTrafficType.toString() + "_" + sampleName + "pct" + "_"
+					+ LocalDate.now() + "_" + LocalTime.now().toSecondOfDay() + "_" + resistanceFactorsPerModelType)
+				.toString());
+		else
+			config.controller().setOutputDirectory(output.toString());
+
+		// Reset some config values that are not needed
+		config.controller().setFirstIteration(0);
+		config.controller().setLastIteration(MATSimIterationsAfterDemandGeneration);
+		config.plans().setInputFile(null);
+		config.transit().setTransitScheduleFile(null);
+		config.transit().setVehiclesFile(null);
+		config.counts().setInputFile(null);
+		config.facilities().setInputFile(pathToCommercialFacilities.toString());
+		// Set flow and storage capacity to a high value
+		config.qsim().setFlowCapFactor(sample * 4);
+		config.qsim().setStorageCapFactor(sample * 4);
+		config.qsim().setUsePersonIdForMissingVehicleId(true);
+
+		// Overwrite network
+		if (network != null)
+			config.network().setInputFile(network);
+
+		// Some files are written before the controller is created, deleting the directory is not an option
+		config.controller().setOverwriteFileSetting(overwriteExistingFiles);
+		OutputDirectoryLogging.initLogging(new OutputDirectoryHierarchy(config));
+
+		new File(Path.of(config.controller().getOutputDirectory()).resolve("calculatedData").toString()).mkdir();
+
+		this.rnd = new Random(config.global().getRandomSeed());
+		this.rng = new MersenneTwister(config.global().getRandomSeed());
+
+		if (config.network().getInputFile() == null)
+			throw new Exception("No network file in config");
+		if (config.global().getCoordinateSystem() == null)
+			throw new Exception("No global CRS is set in config");
+		if (config.controller().getOutputDirectory() == null)
+			throw new Exception("No output directory was set");
+
+		return config;
+	}
+
+	/**
+	 * Prepares the controller.
+	 */
+	private Controller prepareController(Scenario scenario) {
+		Controller controller = ControllerUtils.createController(scenario);
+
+		controller.addOverridingModule(new CarrierModule());
+		controller.addOverridingModule(new AbstractModule() {
+			@Override
+			public void install() {
+				bind(CarrierScoringFunctionFactory.class).to(CarrierScoringFunctionFactoryImpl.class);
+			}
+		});
+
+		controller.getConfig().vspExperimental().setVspDefaultsCheckingLevel(VspExperimentalConfigGroup.VspDefaultsCheckingLevel.abort);
+
+		return controller;
+	}
+
+	/**
+	 * Creates the carriers and the related demand, based on the generated
+	 * TripDistributionMatrix.
+	 * @param scenario Scenario (loaded from your config), where the carriers will be put into
+	 * @param smallScaleCommercialTrafficType Selected traffic types. Options: commercialPersonTraffic, goodsTraffic
+	 */
+	public void createCarriers(Scenario scenario,
+							   SmallScaleCommercialTrafficType smallScaleCommercialTrafficType) {
+
+		int maxNumberOfCarrier = odMatrix.getListOfPurposes().size() * odMatrix.getListOfZones().size()
+			* odMatrix.getListOfModesOrVehTypes().size();
+		int createdCarrier = 0;
+		int fixedNumberOfVehiclePerTypeAndLocation = 1; //TODO possible improvement, perhaps check KiD
+
+		CarrierVehicleTypes carrierVehicleTypes = CarriersUtils.getOrAddCarrierVehicleTypes(scenario);
+		Map<Id<VehicleType>, VehicleType> additionalCarrierVehicleTypes = scenario.getVehicles().getVehicleTypes();
+
+		// Only a vehicle with cost information will work properly
+		additionalCarrierVehicleTypes.values().stream()
+			.filter(vehicleType -> vehicleType.getCostInformation().getCostsPerSecond() != null)
+			.forEach(vehicleType -> carrierVehicleTypes.getVehicleTypes().putIfAbsent(vehicleType.getId(), vehicleType));
+
+		for (VehicleType vehicleType : carrierVehicleTypes.getVehicleTypes().values()) {
+			CostInformation costInformation = vehicleType.getCostInformation();
+			VehicleUtils.setCostsPerSecondInService(costInformation, costInformation.getCostsPerSecond());
+			VehicleUtils.setCostsPerSecondWaiting(costInformation, costInformation.getCostsPerSecond());
+		}
+
+		for (Integer purpose : odMatrix.getListOfPurposes()) {
+			for (String startZone : odMatrix.getListOfZones()) {
+				for (String modeORvehType : odMatrix.getListOfModesOrVehTypes()) {
+
+					// Check if this purpose, startZone, modeORvehType combination is a possiblr starting location (by looking if it has a trip-distribution-entry)
+					boolean isStartingLocation = false;
+					checkIfIsStartingPosition:
+					{
+						for (String possibleStopZone : odMatrix.getListOfZones()) {
+							if (!modeORvehType.equals("pt") && !modeORvehType.equals("op"))
+								if (odMatrix.getTripDistributionValue(startZone, possibleStopZone, modeORvehType,
+									purpose, smallScaleCommercialTrafficType) != 0) {
+									isStartingLocation = true;
+									break checkIfIsStartingPosition;
+								}
+						}
+					}
+
+					if (isStartingLocation) {
+						// Get the vehicle-types and start/stop-categories
+						VehicleSelection.OdMatrixEntryInformation odMatrixEntry = vehicleSelection.getOdMatrixEntryInformation(purpose, modeORvehType, smallScaleCommercialTrafficType);
+
+						// use only types of the possibleTypes which are in the given types file
+						List<String> vehicleTypes = new ArrayList<>();
+						assert odMatrixEntry.possibleVehicleTypes != null: "possibleVehicleTypes is null for odMatrixEntry:" + odMatrixEntry;
+
+						for (String possibleVehicleType : odMatrixEntry.possibleVehicleTypes) {
+							if (CarriersUtils.getOrAddCarrierVehicleTypes(scenario).getVehicleTypes().containsKey(
+								Id.create(possibleVehicleType, VehicleType.class)))
+								vehicleTypes.add(possibleVehicleType);
+						}
+
+						String selectedStartCategory = getSelectedStartCategory(startZone, odMatrixEntry);
+
+						// Generate carrierName
+						String carrierName = null;
+						if (smallScaleCommercialTrafficType.equals(SmallScaleCommercialTrafficType.goodsTraffic)) {
+							carrierName = "Carrier_Goods_" + startZone + "_purpose_" + purpose + "_" + modeORvehType;
+						} else if (smallScaleCommercialTrafficType.equals(SmallScaleCommercialTrafficType.commercialPersonTraffic))
+							carrierName = "Carrier_Business_" + startZone + "_purpose_" + purpose;
+						int numberOfDepots = odMatrix.getSumOfServicesForStartZone(startZone, modeORvehType, purpose,
+							smallScaleCommercialTrafficType);
+
+						// Create the Carrier
+						CarrierCapabilities.FleetSize fleetSize = CarrierCapabilities.FleetSize.FINITE;
+						ArrayList<String> vehicleDepots = new ArrayList<>();
+						createdCarrier++;
+						log.info("Create carrier number {} of a maximum Number of {} carriers.", createdCarrier, maxNumberOfCarrier);
+						log.info("Carrier: {}; depots: {}; services: {}", carrierName, numberOfDepots,
+							(int) Math.ceil(odMatrix.getSumOfServicesForStartZone(startZone, modeORvehType,
+								purpose, smallScaleCommercialTrafficType) / odMatrixEntry.occupancyRate));
+
+						CarrierAttributes carrierAttributes = new CarrierAttributes(purpose, startZone, selectedStartCategory, modeORvehType,
+							smallScaleCommercialTrafficType, vehicleDepots, odMatrixEntry);
+						if(carrierId2carrierAttributes.putIfAbsent(Id.create(carrierName, Carrier.class), carrierAttributes) != null)
+							throw new RuntimeException("CarrierAttributes already exist for the carrier " + carrierName);
+
+						createNewCarrierAndAddVehicleTypes(scenario, carrierName, carrierAttributes, vehicleTypes, numberOfDepots, fleetSize,
+							fixedNumberOfVehiclePerTypeAndLocation);
+
+						// Now Create services for this carrier
+						Carrier newCarrier = CarriersUtils.getCarriers(scenario).getCarriers().get(Id.create(carrierName, Carrier.class));
+
+						createServices(newCarrier, carrierAttributes);
+					}
+				}
+			}
+		}
+		log.warn("The jspritIterations are now set to {} in this simulation!", jspritIterations);
+		log.info("Finished creating {} carriers including related services.", createdCarrier);
+	}
+
+	/**
+	 * Selects a start category for the given start zone, based on the possible start categories for this zone.
+	 *
+	 * @param startZone     zone where the carrier starts
+	 * @param odMatrixEntry odMatrixEntry
+	 * @return the selected start category
+	 */
+	protected String getSelectedStartCategory(String startZone, VehicleSelection.OdMatrixEntryInformation odMatrixEntry) {
+		Collections.shuffle(odMatrixEntry.possibleStartCategories, rnd);
+		String selectedStartCategory = odMatrixEntry.possibleStartCategories.getFirst();
+		// Find a (random) start category with existing employees in this zone
+		// we start with count = 1 because the first category is already selected, and if this category has employees, we can use it.
+		// Otherwise, we have to find another category.
+		for (int count = 1; resultingDataPerZone.get(startZone).getDouble(selectedStartCategory) == 0; count++) {
+			if (count < odMatrixEntry.possibleStartCategories.size())
+				selectedStartCategory = odMatrixEntry.possibleStartCategories.get(count);
+			else {
+				// if no possible start category with employees is found, take a random category of the stop categories,
+				// the reason that no start category with employees is found is that traffic volume for employees in general is created,
+				// so that it is possible that we have traffic, although we have no employees in the given start category.
+				// That's why we exclude Inhabitants as a possible start category.
+				selectedStartCategory = odMatrixEntry.possibleStopCategories.get(rnd.nextInt(odMatrixEntry.possibleStopCategories.size()));
+				if (selectedStartCategory.equals("Inhabitants"))
+					selectedStartCategory = odMatrixEntry.possibleStopCategories.get(rnd.nextInt(odMatrixEntry.possibleStopCategories.size()));
+				if (resultingDataPerZone.get(startZone).getDouble(selectedStartCategory) > 0)
+					log.warn(
+						"No possible start category with employees found for zone {}. Take a random category of the stop categories: {}. The possible start categories are: {}",
+						startZone, selectedStartCategory, odMatrixEntry.possibleStartCategories);
+			}
+		}
+		return selectedStartCategory;
+	}
+
+	/**
+	 * Generates and adds the services for the given carrier.
+	 */
+	private void createServices(Carrier newCarrier, CarrierAttributes carrierAttributes) {
+		log.info("Create services for carrier: {}", newCarrier.getId());
+		for (String stopZone : odMatrix.getListOfZones()) {
+			int trafficVolumeForOD = Math.round((float)odMatrix.getTripDistributionValue(carrierAttributes.startZone,
+				stopZone, carrierAttributes.modeORvehType, carrierAttributes.purpose, carrierAttributes.smallScaleCommercialTrafficType));
+			int numberOfJobs = (int) Math.ceil(trafficVolumeForOD / carrierAttributes.odMatrixEntry.occupancyRate);
+			if (numberOfJobs == 0)
+				continue;
+			// find a category for the tour stop with existing employees in this zone
+			String selectedStopCategory = carrierAttributes.odMatrixEntry.possibleStopCategories.get(rnd.nextInt(carrierAttributes.odMatrixEntry.possibleStopCategories.size()));
+			while (resultingDataPerZone.get(stopZone).getDouble(selectedStopCategory) == 0)
+				selectedStopCategory = carrierAttributes.odMatrixEntry.possibleStopCategories.get(rnd.nextInt(carrierAttributes.odMatrixEntry.possibleStopCategories.size()));
+			for (int i = 0; i < numberOfJobs; i++) {
+				// additionalTravelBufferPerIterationInMinutes is only used for recalculation of the service time if a carrier solution could not handle all services
+				int serviceTimePerStop = getServiceTimePerStop(newCarrier, carrierAttributes, 0);
+
+				TimeWindow serviceTimeWindow = TimeWindow.newInstance(0, 36 * 3600); // extended time window, so that late tours can handle it
+				createService(newCarrier, carrierAttributes.vehicleDepots, selectedStopCategory, stopZone, serviceTimePerStop, serviceTimeWindow);
+			}
+		}
+	}
+
+	/**
+	 * Give a service duration based on the purpose and the trafficType under a given probability
+	 *
+	 * @param carrier                                     The carrier for which the service time should be calculated
+	 * @param carrierAttributes                           The attributes of the carrier
+	 * @param additionalTravelBufferPerIterationInMinutes Additional travel buffer per recalculation iteration for a carrier in minutes
+	 * @return The service time in seconds
+	 */
+	public Integer getServiceTimePerStop(Carrier carrier, CarrierAttributes carrierAttributes,
+										 int additionalTravelBufferPerIterationInMinutes) {
+		ServiceDurationPerCategoryKey key;
+		// we use the start category for the service time selection because the start category represents the employees
+		if (carrierAttributes.smallScaleCommercialTrafficType().equals(
+			SmallScaleCommercialTrafficType.commercialPersonTraffic)) {
+			if (!carrierAttributes.odMatrixEntry().possibleStartCategories.contains(carrierAttributes.selectedStartCategory()))
+				key = GenerateSmallScaleCommercialTrafficDemand.makeServiceDurationPerCategoryKey(carrierAttributes.odMatrixEntry().possibleStartCategories.get(rnd.nextInt(carrierAttributes.odMatrixEntry().possibleStartCategories.size())), null, carrierAttributes.smallScaleCommercialTrafficType());
+			else
+				key = GenerateSmallScaleCommercialTrafficDemand.makeServiceDurationPerCategoryKey(carrierAttributes.selectedStartCategory(), null,
+					carrierAttributes.smallScaleCommercialTrafficType());
+		}
+		else if (carrierAttributes.smallScaleCommercialTrafficType().equals(
+			SmallScaleCommercialTrafficType.goodsTraffic)) {
+			key = GenerateSmallScaleCommercialTrafficDemand.makeServiceDurationPerCategoryKey(carrierAttributes.selectedStartCategory(),
+				carrierAttributes.modeORvehType(), carrierAttributes.smallScaleCommercialTrafficType());
+		} else {
+			throw new RuntimeException("Unknown traffic type: " + carrierAttributes.smallScaleCommercialTrafficType());
+		}
+		// additionalTravelBufferPerIterationInMinutes is only used for recalculation of the service time if a carrier solution could not handle all services
+		if (additionalTravelBufferPerIterationInMinutes == 0) {
+			DurationsBounds serviceDurationBounds = serviceDurationTimeSelector.get(key).sample();
+
+			int serviceDurationLowerBound = serviceDurationBounds.minDuration();
+			int serviceDurationUpperBound = serviceDurationBounds.maxDuration();
+			return rnd.nextInt(serviceDurationLowerBound * 60, serviceDurationUpperBound * 60);
+		} else {
+			return unhandledServicesSolution.changeServiceTimePerStop(carrier, carrierAttributes, key, additionalTravelBufferPerIterationInMinutes);
+		}
+	}
+
+	/**
+	 * Adds a service with the given attributes to the carrier.
+	 */
+	private void createService(Carrier newCarrier, ArrayList<String> noPossibleLinks, String selectedStopCategory, String stopZone,
+							   Integer serviceTimePerStop, TimeWindow serviceTimeWindow) {
+
+		Id<Link> linkId = findPossibleLink(stopZone, selectedStopCategory, noPossibleLinks);
+		Id<CarrierService> idNewService = Id.create(newCarrier.getId().toString() + "_" + linkId + "_" + rnd.nextInt(10000),
+			CarrierService.class);
+
+		CarrierService thisService = CarrierService.Builder.newInstance(idNewService, linkId,0)
+			.setServiceDuration(serviceTimePerStop)
+			.setServiceStartingTimeWindow(serviceTimeWindow)
+			.build();
+		CarriersUtils.addService(newCarrier, thisService);
+	}
+
+
+
+	/**
+	 * Creates the carrier and the related vehicles.
+	 */
+	private void createNewCarrierAndAddVehicleTypes(Scenario scenario, String carrierName, CarrierAttributes carrierAttributes,
+													List<String> vehicleTypes, int numberOfDepots, CarrierCapabilities.FleetSize fleetSize,
+													int fixedNumberOfVehiclePerTypeAndLocation) {
+
+		Carriers carriers = CarriersUtils.addOrGetCarriers(scenario);
+		CarrierVehicleTypes carrierVehicleTypes = CarriersUtils.getOrAddCarrierVehicleTypes(scenario);
+
+		CarrierCapabilities carrierCapabilities;
+
+		Carrier thisCarrier = CarriersUtils.createCarrier(Id.create(carrierName, Carrier.class));
+		if (carrierAttributes.smallScaleCommercialTrafficType.equals(SmallScaleCommercialTrafficType.commercialPersonTraffic) && carrierAttributes.purpose == 3)
+			thisCarrier.getAttributes().putAttribute("subpopulation", carrierAttributes.smallScaleCommercialTrafficType + "_service");
+		else
+			thisCarrier.getAttributes().putAttribute("subpopulation", carrierAttributes.smallScaleCommercialTrafficType);
+
+		thisCarrier.getAttributes().putAttribute("purpose", carrierAttributes.purpose);
+		thisCarrier.getAttributes().putAttribute("tourStartArea", carrierAttributes.startZone);
+		if (jspritIterations > 0)
+			CarriersUtils.setJspritIterations(thisCarrier, jspritIterations);
+		carrierCapabilities = CarrierCapabilities.Builder.newInstance().setFleetSize(fleetSize).build();
+
+		carriers.addCarrier(thisCarrier);
+
+		while (carrierAttributes.vehicleDepots.size() < numberOfDepots) {
+			Id<Link> linkId = findPossibleLink(carrierAttributes.startZone, carrierAttributes.selectedStartCategory, null);
+			carrierAttributes.vehicleDepots.add(linkId.toString());
+		}
+
+		for (String singleDepot : carrierAttributes.vehicleDepots) {
+			TourStartAndDuration t = tourDistribution.get(carrierAttributes.smallScaleCommercialTrafficType).sample();
+			int vehicleStartTime = t.getVehicleStartTime(this.rnd);
+			int tourDuration = t.getVehicleTourDuration(this.rnd);
+			int vehicleEndTime = vehicleStartTime + tourDuration;
+			for (String thisVehicleType : vehicleTypes) { //TODO Flottenzusammensetzung anpassen. Momentan pro Depot alle Fahrzeugtypen 1x erzeugen
+				VehicleType thisType = carrierVehicleTypes.getVehicleTypes()
+					.get(Id.create(thisVehicleType, VehicleType.class));
+				if (fixedNumberOfVehiclePerTypeAndLocation == 0)
+					fixedNumberOfVehiclePerTypeAndLocation = 1;
+				for (int i = 0; i < fixedNumberOfVehiclePerTypeAndLocation; i++) {
+					CarrierVehicle newCarrierVehicle = CarrierVehicle.Builder
+						.newInstance(
+							Id.create(
+								thisCarrier.getId().toString() + "_"
+									+ (carrierCapabilities.getCarrierVehicles().size() + 1),
+								Vehicle.class),
+							Id.createLinkId(singleDepot), thisType)
+						.setEarliestStart(vehicleStartTime).setLatestEnd(vehicleEndTime).build();
+					carrierCapabilities.getCarrierVehicles().put(newCarrierVehicle.getId(), newCarrierVehicle);
+					if (!carrierCapabilities.getVehicleTypes().contains(thisType))
+						carrierCapabilities.getVehicleTypes().add(thisType);
+				}
+			}
+
+			thisCarrier.setCarrierCapabilities(carrierCapabilities);
+		}
+	}
+
+	/**
+	 * Finds a possible link for a service or the vehicle location.
+	 */
+	private Id<Link> findPossibleLink(String zone, String selectedCategory, List<String> noPossibleLinks) {
+		Id<Link> newLink = null;
+		for (int a = 0; newLink == null && a < facilitiesPerZone.get(zone).get(selectedCategory).size() * 2; a++) {
+
+			ActivityFacility possibleBuilding = facilitiesPerZone.get(zone).get(selectedCategory)
+				.get(rnd.nextInt(facilitiesPerZone.get(zone).get(selectedCategory).size())); //TODO Wkt für die Auswahl anpassen
+			Coord centroidPointOfBuildingPolygon = possibleBuilding.getCoord();
+
+			int numberOfPossibleLinks = linksPerZone.get(zone).size();
+
+			// searches and selects the nearest link of the possible links in this zone
+			newLink = SmallScaleCommercialTrafficUtils.findNearestPossibleLink(zone, noPossibleLinks, linksPerZone, null,
+				centroidPointOfBuildingPolygon, numberOfPossibleLinks);
+		}
+		if (newLink == null)
+			throw new RuntimeException("No possible link for buildings with type '" + selectedCategory + "' in zone '"
+				+ zone + "' found. buildings in category: " + facilitiesPerZone.get(zone).get(selectedCategory)
+				+ "; possibleLinks in zone: " + linksPerZone.get(zone).size());
+		return newLink;
+	}
+
+	/**
+	 * Filters links by used mode "car" and creates Map with all links in each zone
+	 */
+	static Map<String, Map<Id<Link>, Link>> filterLinksForZones(Scenario scenario, Index indexZones,
+																Map<String, Map<String, List<ActivityFacility>>> facilitiesPerZone,
+																String shapeFileZoneNameColumn) {
+		Map<String, Map<Id<Link>, Link>> linksPerZone = new HashMap<>();
+		log.info("Filtering and assign links to zones. This take some time...");
+
+		TransportModeNetworkFilter filter = new TransportModeNetworkFilter(scenario.getNetwork());
+		Set<String> modes = new HashSet<>(scenario.getConfig().routing().getNetworkModes());
+		Network filteredNetwork = NetworkUtils.createNetwork(scenario.getConfig().network());
+		filter.filter(filteredNetwork, modes);
+
+		CoordinateTransformation ct = indexZones.getShp().createTransformation(ProjectionUtils.getCRS(scenario.getNetwork()));
+		//TODO possible check if newCoord attribute is really needed (find better way)
+		List<Link> links = new ArrayList<>(filteredNetwork.getLinks().values());
+		links.forEach(l -> l.getAttributes().putAttribute("newCoord",
+			CoordUtils.round(ct.transform(l.getCoord()))));
+		links.forEach(l -> l.getAttributes().putAttribute("zone",
+			indexZones.query((Coord) l.getAttributes().getAttribute("newCoord"))));
+		links = links.stream().filter(l -> l.getAttributes().getAttribute("zone") != null).toList();
+		links.forEach(l -> linksPerZone
+			.computeIfAbsent((String) l.getAttributes().getAttribute("zone"), (k) -> new HashMap<>())
+			.put(l.getId(), l));
+		if (linksPerZone.size() != indexZones.size())
+			findNearestLinkForZonesWithoutLinks(filteredNetwork, linksPerZone, indexZones, facilitiesPerZone, shapeFileZoneNameColumn);
+
+		return linksPerZone;
+	}
+
+	/**
+	 * Finds for areas without links the nearest Link if the area contains any building.
+	 */
+	private static void findNearestLinkForZonesWithoutLinks(Network networkToChange, Map<String, Map<Id<Link>, Link>> linksPerZone,
+															Index shpZones,
+															Map<String, Map<String, List<ActivityFacility>>> facilitiesPerZone,
+															String shapeFileZoneNameColumn) {
+		for (SimpleFeature singleArea : shpZones.getAllFeatures()) {
+			String zoneID = (String) singleArea.getAttribute(shapeFileZoneNameColumn);
+			if (!linksPerZone.containsKey(zoneID) && facilitiesPerZone.get(zoneID) != null) {
+				for (List<ActivityFacility> buildingList : facilitiesPerZone.get(zoneID).values()) {
+					for (ActivityFacility building : buildingList) {
+						Link l = NetworkUtils.getNearestLinkExactly(networkToChange, building.getCoord());
+						assert l != null;
+						linksPerZone
+							.computeIfAbsent(zoneID, (k) -> new HashMap<>())
+							.put(l.getId(), l);
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Creates the number of trips between the zones for each mode and purpose.
+	 */
+	private TripDistributionMatrix createTripDistribution(
+		Map<TrafficVolumeGeneration.TrafficVolumeKey, Object2DoubleMap<Integer>> trafficVolume_start,
+		Map<TrafficVolumeGeneration.TrafficVolumeKey, Object2DoubleMap<Integer>> trafficVolume_stop,
+		SmallScaleCommercialTrafficType smallScaleCommercialTrafficType, Scenario scenario, Path output)
+		throws Exception {
+
+		ArrayList<String> listOfZones = new ArrayList<>();
+		trafficVolume_start.forEach((k, v) -> {
+			if (!listOfZones.contains(k.zone()))
+				listOfZones.add(k.zone());
+		});
+		final TripDistributionMatrix odMatrix = TripDistributionMatrix.Builder
+			.newInstance(indexZones, shapeFileZoneNameColumn, trafficVolume_start, trafficVolume_stop, smallScaleCommercialTrafficType, listOfZones).build();
+		Network network = scenario.getNetwork();
+		int count = 0;
+		log.info("Create trip distribution for traffic type {} with resistance factor {}.", smallScaleCommercialTrafficType, resistanceFactorsPerModelType.get(smallScaleCommercialTrafficType).toString());
+		for (TrafficVolumeGeneration.TrafficVolumeKey trafficVolumeKey : trafficVolume_start.keySet()) {
+			count++;
+			if (count % 50 == 0 || count == 1)
+				log.info("Create OD pair {} of {}", count, trafficVolume_start.size());
+
+			String startZone = trafficVolumeKey.zone();
+			String modeORvehType = trafficVolumeKey.modeORvehType();
+			for (Integer purpose : trafficVolume_start.get(trafficVolumeKey).keySet()) {
+				Collections.shuffle(listOfZones, rnd);
+				for (String stopZone : listOfZones) {
+					odMatrix.setTripDistributionValue(startZone, stopZone, modeORvehType, purpose, smallScaleCommercialTrafficType,
+						network, linksPerZone, resistanceFactorsPerModelType.get(smallScaleCommercialTrafficType));
+				}
+			}
+		}
+		odMatrix.clearRoundingError(rnd);
+		odMatrix.writeODMatrices(output, smallScaleCommercialTrafficType);
+		return odMatrix;
+	}
+
+	public Map<SmallScaleCommercialTrafficType, EnumeratedDistribution<TourStartAndDuration>> getTourDistribution() {
+		return tourDistribution;
+	}
+
+	public Map<ServiceDurationPerCategoryKey, EnumeratedDistribution<DurationsBounds>> getServiceDurationTimeSelector() {
+		return serviceDurationTimeSelector;
+	}
+
+	public Map<Id<Carrier>, CarrierAttributes> getCarrierId2carrierAttributes() {
+		return carrierId2carrierAttributes;
+	}
+
+	public int getMaxReplanningIterations(){
+		return maxReplanningIterations;
+	}
+
+	public int getAdditionalTravelBufferPerIterationInMinutes(){
+		return additionalTravelBufferPerIterationInMinutes;
+	}
+
+	public record ServiceDurationPerCategoryKey(String employeeCategory, String vehicleType, SmallScaleCommercialTrafficType smallScaleCommercialTrafficType) {}
+
+	public static ServiceDurationPerCategoryKey makeServiceDurationPerCategoryKey(String employeeCategory, String vehicleType, SmallScaleCommercialTrafficType smallScaleCommercialTrafficType) {
+		return new ServiceDurationPerCategoryKey(employeeCategory, vehicleType, smallScaleCommercialTrafficType);
+	}
+
+	public record TourStartAndDuration(int hourLower, int hourUpper, double minDuration, double maxDuration) {
+		/**
+		 * Gives a duration for the created tour under the given probability.
+		 */
+		public int getVehicleTourDuration(Random rnd) {
+			if (minDuration == 0.)
+				return (int) maxDuration() * 60;
+			else
+				return (int) rnd.nextDouble(minDuration * 60, maxDuration * 60);
+		}
+
+		/**
+		 * Gives a tour start time for the created tour under the given probability.
+		 */
+		public int getVehicleStartTime(Random rnd) {
+			return rnd.nextInt(hourLower * 3600, hourUpper * 3600);
+		}
+	}
+
+	public record DurationsBounds(int minDuration, int maxDuration) {}
+
+	/**
+	 * The attributes of a carrier, used during the generation
+	 * @param purpose purpose of this carrier denoted as an index. Can be used in {@link VehicleSelection} to get more information about this carrier.
+	 * @param startZone start zone of this carrier, entry from {@link TripDistributionMatrix#getListOfZones()}
+	 * @param selectedStartCategory start category of this carrier, selected randomly from {@link VehicleSelection.OdMatrixEntryInformation#possibleStartCategories}
+	 * @param modeORvehType entry from {@link TripDistributionMatrix#getListOfModesOrVehTypes()}
+	 * @param smallScaleCommercialTrafficType Entry from {@link SmallScaleCommercialTrafficType} for this carrier
+	 *                                        <i>(NOTE: This value only differs between carriers if {@link SmallScaleCommercialTrafficType#completeSmallScaleCommercialTraffic is selected)</i>
+	 * @param vehicleDepots Containing the depots of this carrier with linkIds as strings
+	 */
+	public record CarrierAttributes(int purpose, String startZone, String selectedStartCategory, String modeORvehType,
+									SmallScaleCommercialTrafficType smallScaleCommercialTrafficType, ArrayList<String> vehicleDepots,
+									VehicleSelection.OdMatrixEntryInformation odMatrixEntry) {}
+}

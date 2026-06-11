@@ -1,0 +1,28 @@
+.settings/
+.project
+.metadata
+*.DS_Store
+# IntelliJ Files
+*.iml
+.idea
+matsimExamples
+**/target
+/log_projects.log
+*.orig
+matsim/docs/doxygen/html
+matsim/src/main/java/Doxyfile
+
+# VS Code files
+.vscode
+
+# GitHub Actions from upstream MATSim are not used for this deployment repo
+.github/workflows/
+
+# Local IDE/workspace metadata
+.metadata/
+
+# Local Maven cache used for offline/project-local builds
+.m2-local/
+
+# ignore output directories:
+output/
