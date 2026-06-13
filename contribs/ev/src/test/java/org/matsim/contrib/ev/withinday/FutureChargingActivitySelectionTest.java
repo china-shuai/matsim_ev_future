@@ -46,55 +46,103 @@ public class FutureChargingActivitySelectionTest {
 	}
 
 	@Test
-    public void testPreferredLatentNonHomeActivitySuppressesHomeCharging() {
-        TestRun run = runFutureScenario(false);
+	public void testPreferredHomeActivityDoesNotRequirePreplannedHomeSlot() {
+		TestRun run = runFutureScenario(true, 0.8, 0.0, NoPreplannedSlotProvider.class);
 
-        assertEquals(0, run.scenario().tracker().startChargingProcessEvents.size(),
-                "Selecting latent PFC must remove the later real HOME charging slot.");
-        var records = run.model().consumeLatentPublicDemandRecords();
-        assertEquals(1, records.size());
-        var record = records.getFirst();
-        assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
-        assertEquals("CONDITIONAL_DEMAND", record.demandType());
-        assertFalse(record.socUpdated());
-        assertTrue(record.energyDemand() > 0.0,
-                "Conditional latent demand must record the required charging energy.");
-        assertTrue(record.demandDuration() > 0.0,
-                "Conditional latent demand must record the required charging duration.");
-        assertEquals(0.0, record.chargedEnergy(), 1e-9,
-                "Conditional latent demand is recorded without changing simulated SOC.");
-    }
+		assertEquals(0, run.model().consumeLatentPublicDemandRecords().size(),
+				"Selecting HOME must not fall back to latent demand when no strategic home slot was preplanned.");
+		assertEquals(1, run.scenario().tracker().startChargingProcessEvents.size(),
+				"A HOME activity with a private charger must be turned into an executable home charging slot.");
+		assertEquals(1, run.scenario().tracker().finishChargingProcessEvents.size());
+	}
 
-    @Test
-    public void testMandatoryLatentDemandRecordsAndAppliesChargedEnergy() {
-        TestRun run = runFutureScenario(false, 0.1, 0.2);
+	@Test
+	public void testPreferredHomeActivityRequiresChargingModeLegForSyntheticSlot() {
+		TestRun run = runFutureScenario(true, 0.8, 0.0, NoPreplannedSlotProvider.class, "walk");
 
-        var records = run.model().consumeLatentPublicDemandRecords();
-        assertEquals(1, records.size());
-        var record = records.getFirst();
-        assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
-        assertEquals("MANDATORY_FEASIBILITY", record.demandType());
-        assertTrue(record.socUpdated());
-        assertTrue(record.energyDemand() > 0.0,
-                "Mandatory latent demand must record the required charging energy.");
-        assertEquals(record.energyDemand(), record.chargedEnergy(), 1e-9,
-                "Mandatory latent charging must apply the demanded energy to simulated SOC.");
-        assertTrue(record.socAfterCharging() > record.soc());
-    }
+		assertEquals(0, run.model().consumeLatentPublicDemandRecords().size(),
+				"A non-car plan must not create latent EV charging demand.");
+		assertEquals(0, run.scenario().tracker().startChargingProcessEvents.size(),
+				"A HOME slot must not be synthesized when the plan has no EV car leg.");
+		assertEquals(0, run.scenario().tracker().finishChargingProcessEvents.size());
+	}
 
-    private TestRun runFutureScenario(boolean preferHome) {
-        return runFutureScenario(preferHome, 0.8, 0.0);
-    }
+	@Test
+	public void testPreferredHomeActivityRequiresChargingModeArrivalForSyntheticSlot() {
+		TestRun run = runFutureScenario(true, 0.8, 0.0, NoPreplannedSlotProvider.class, "car", "walk", "walk");
 
-    private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc) {
-        TestScenario scenario = new TestScenarioBuilder(utils)
-                .setElectricVehicleRange(100_000.0)
-                .addHomeCharger("person", 0, 0, 1, 1.0, "default")
-                .addPerson("person", initialSoc)
-                .addActivity("home", 0, 0, 8.0 * 3600.0)
-                .addActivity("work", 3, 3, 17.0 * 3600.0)
-                .addActivity("home", 0, 0, 20.0 * 3600.0)
-				.addActivity("work", 3, 3)
+		assertEquals(0, run.scenario().tracker().startChargingProcessEvents.size(),
+				"A HOME slot must not be synthesized for a HOME activity reached by a non-EV mode.");
+		assertEquals(0, run.scenario().tracker().finishChargingProcessEvents.size());
+	}
+
+	@Test
+	public void testPreferredLatentNonHomeActivitySuppressesHomeCharging() {
+		TestRun run = runFutureScenario(false);
+
+		assertEquals(0, run.scenario().tracker().startChargingProcessEvents.size(),
+				"Selecting latent PFC must remove the later real HOME charging slot.");
+		var records = run.model().consumeLatentPublicDemandRecords();
+		assertEquals(1, records.size());
+		var record = records.getFirst();
+		assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
+		assertEquals("CONDITIONAL_DEMAND", record.demandType());
+		assertFalse(record.socUpdated());
+		assertTrue(record.energyDemand() > 0.0,
+				"Conditional latent demand must record the required charging energy.");
+		assertTrue(record.demandDuration() > 0.0,
+				"Conditional latent demand must record the required charging duration.");
+		assertEquals(0.0, record.chargedEnergy(), 1e-9,
+				"Conditional latent demand is recorded without changing simulated SOC.");
+	}
+
+	@Test
+	public void testMandatoryLatentDemandRecordsAndAppliesChargedEnergy() {
+		TestRun run = runFutureScenario(false, 0.1, 0.2);
+
+		var records = run.model().consumeLatentPublicDemandRecords();
+		assertEquals(1, records.size());
+		var record = records.getFirst();
+		assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
+		assertEquals("MANDATORY_FEASIBILITY", record.demandType());
+		assertTrue(record.socUpdated());
+		assertTrue(record.energyDemand() > 0.0,
+				"Mandatory latent demand must record the required charging energy.");
+		assertEquals(record.energyDemand(), record.chargedEnergy(), 1e-9,
+				"Mandatory latent charging must apply the demanded energy to simulated SOC.");
+		assertTrue(record.socAfterCharging() > record.soc());
+	}
+
+	private TestRun runFutureScenario(boolean preferHome) {
+		return runFutureScenario(preferHome, 0.8, 0.0);
+	}
+
+	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc) {
+		return runFutureScenario(preferHome, initialSoc, minimumSoc, MiddayHomeSlotProvider.class);
+	}
+
+	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
+			Class<? extends ChargingSlotProvider> slotProviderClass) {
+		return runFutureScenario(preferHome, initialSoc, minimumSoc, slotProviderClass, "car");
+	}
+
+	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
+			Class<? extends ChargingSlotProvider> slotProviderClass, String travelMode) {
+		return runFutureScenario(preferHome, initialSoc, minimumSoc, slotProviderClass, travelMode, travelMode,
+				travelMode);
+	}
+
+	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
+			Class<? extends ChargingSlotProvider> slotProviderClass, String firstWorkMode, String homeMode,
+			String secondWorkMode) {
+		TestScenario scenario = new TestScenarioBuilder(utils)
+				.setElectricVehicleRange(100_000.0)
+				.addHomeCharger("person", 0, 0, 1, 1.0, "default")
+				.addPerson("person", initialSoc)
+				.addActivity("home", 0, 0, 8.0 * 3600.0)
+				.addActivity("work", 3, 3, 17.0 * 3600.0, firstWorkMode)
+				.addActivity("home", 0, 0, 20.0 * 3600.0, homeMode)
+				.addActivity("work", 3, 3, secondWorkMode)
 				.build();
 
 		var person = scenario.scenario().getPopulation().getPersons().get(Id.createPersonId("person"));
@@ -126,7 +174,7 @@ public class FutureChargingActivitySelectionTest {
 		controler.addOverridingQSimModule(new AbstractQSimModule() {
 			@Override
 			protected void configureQSim() {
-				bind(ChargingSlotProvider.class).to(MiddayHomeSlotProvider.class);
+				bind(ChargingSlotProvider.class).to(slotProviderClass);
 				bind(ChargingDecisionStrategy.class).toInstance(new FutureChargingDecisionStrategy(model));
 			}
 		});
@@ -159,6 +207,13 @@ public class FutureChargingActivitySelectionTest {
 					.findFirst()
 					.orElseThrow();
 			return new ArrayList<>(List.of(new ChargingSlot(middayHome, middayHome, homeCharger)));
+		}
+	}
+
+	private static final class NoPreplannedSlotProvider implements ChargingSlotProvider {
+		@Override
+		public List<ChargingSlot> findSlots(Person person, Plan plan, ElectricVehicle vehicle) {
+			return List.of();
 		}
 	}
 }

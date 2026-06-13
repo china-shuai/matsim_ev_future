@@ -12,6 +12,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
+import java.util.Set;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -140,6 +141,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 	private final TimeInterpretation timeInterpretation;
 	private ChargingScheduler chargingScheduler;
 	private final ChargingInfrastructure chargingInfrastructure;
+	private final ChargingSlotFinder chargingSlotFinder;
 	@Nullable
 	private final ChargingDecisionStrategy chargingDecisionStrategy;
 	@Nullable
@@ -173,11 +175,12 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		this.scenario = scenario;
 		this.chargingStrategyFactory = chargingStrategyFactory;
 		this.chargingInfrastructure = Objects.requireNonNull(chargingInfrastructure, "chargingInfrastructure");
+		this.chargingMode = config.getCarMode();
+		this.chargingSlotFinder = new ChargingSlotFinder(scenario, chargingMode);
 		this.chargingDecisionStrategy = chargingDecisionStrategy;
 		this.futureChargingBehaviourModel = futureChargingBehaviourModel;
 		this.chargingDecisionCollector = chargingDecisionCollector;
 
-		this.chargingMode = config.getCarMode();
 		this.performAbort = config.isAbortAgents();
 		this.maximumQueueWaitTime = config.getMaximumQueueTime();
 		this.allowSpontaneousCharging = config.isAllowSpoantaneousCharging();
@@ -246,7 +249,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 					ChargingSlot wholeDaySlot = null;
 					boolean foundRegularSlot = false;
 
-					List<ChargingSlot> slots = slotProvider.findSlots(plan.getPerson(), plan, vehicle);
+					List<ChargingSlot> slots = new ArrayList<>(slotProvider.findSlots(plan.getPerson(), plan, vehicle));
 					Collections.sort(slots, (first, second) -> {
 						int firstIndex = plan.getPlanElements()
 								.indexOf(first.isLegBased() ? first.leg() : first.startActivity());
@@ -259,9 +262,12 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 					boolean unifiedFutureSelection = usesUnifiedFutureActivitySelection();
 					if (unifiedFutureSelection && vehicle != null && vehicle.getBattery() != null
-							&& vehicleId != null) {
+							&& vehicleId != null && hasChargingModeLeg(plan)) {
 						selectPreferredFutureActivity(plan, slots, vehicle, vehicleId, groupType, homeCharger);
 						ChargingSlot selectedHomeSlot = preferredSlotByVehicle.get(vehicleId);
+						if (selectedHomeSlot != null && !slots.contains(selectedHomeSlot)) {
+							slots.add(selectedHomeSlot);
+						}
 						slots.removeIf(slot -> slot != selectedHomeSlot);
 					} else if (chargingDecisionStrategy != null && vehicle != null && vehicle.getBattery() != null
 							&& vehicleId != null && !slots.isEmpty()) {
@@ -352,6 +358,15 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		}
 
 		return null;
+	}
+
+	private boolean hasChargingModeLeg(Plan plan) {
+		for (PlanElement element : plan.getPlanElements()) {
+			if (element instanceof Leg leg && chargingMode.equals(leg.getMode())) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private void updateInitialVehicleLocation(Plan plan, Id<Vehicle> vehicleId, ChargingSlot slot) {
@@ -1017,6 +1032,21 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			}
 		}
 
+		return findHomeChargerForPerson(personId, originCoord);
+	}
+
+	private Charger findHomeChargerForPerson(Id<Person> personId, Activity activity) {
+		if (chargingInfrastructure == null || personId == null || activity == null) {
+			return null;
+		}
+		return findHomeChargerForPerson(personId, PopulationUtils.decideOnCoordForActivity(activity, scenario));
+	}
+
+	private Charger findHomeChargerForPerson(Id<Person> personId, Coord originCoord) {
+		if (chargingInfrastructure == null || personId == null) {
+			return null;
+		}
+
 		double bestDistance = Double.POSITIVE_INFINITY;
 		Charger best = null;
 
@@ -1130,6 +1160,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 		double initialSoc = Math.max(0.0, Math.min(1.0, vehicle.getBattery().getCharge() / capacity));
 		Map<Activity, Double> socEstimates = estimateSocAtActivities(plan, vehicle);
+		Set<Activity> activityBasedChargingCandidateStarts = hasHomeCharger
+				? findActivityBasedChargingCandidateStarts(plan)
+				: Collections.emptySet();
 		Agent behaviourAgent = new Agent(groupType, hasHomeCharger, plan.getPerson().getId());
 
 		Activity bestActivity = null;
@@ -1155,9 +1188,19 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			ChargingSlot homeSlot = null;
 
 			if (label == FutureChargingActivityLabel.HOME) {
+				if (!hasHomeCharger) {
+					continue;
+				}
 				homeSlot = homeSlots.get(activity);
 				if (homeSlot == null) {
-					continue;
+					if (plan.getPlanElements().indexOf(activity) == 0 || !activityBasedChargingCandidateStarts.contains(activity)) {
+						continue;
+					}
+					Charger charger = findHomeChargerForPerson(plan.getPerson().getId(), activity);
+					if (charger == null) {
+						continue;
+					}
+					homeSlot = new ChargingSlot(activity, activity, charger);
 				}
 				feasible = EnumSet.of(FutureChargingSupplyType.HOME);
 			} else {
@@ -1210,6 +1253,15 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			preferredLatentPublicActivityByVehicle.put(vehicleId, selectedActivity);
 			futureChargingBehaviourModel.recordLatentDemandPreferredSelected(groupType, personId);
 		}
+	}
+
+	private Set<Activity> findActivityBasedChargingCandidateStarts(Plan plan) {
+		Set<Activity> starts = Collections.newSetFromMap(new IdentityHashMap<>());
+		for (ChargingSlotFinder.ActivityBasedCandidate candidate : chargingSlotFinder.findActivityBased(plan.getPerson(),
+				plan)) {
+			starts.add(candidate.startActivity());
+		}
+		return starts;
 	}
 
 	/**
