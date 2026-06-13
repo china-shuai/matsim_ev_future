@@ -1349,12 +1349,30 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		}
 		futureChargingBehaviourModel.recordLatentDemandDecisionEvaluated(groupType, personId);
 		FutureChargingActivity futureActivity = new FutureChargingActivity(label, band, soc, null, feasible);
+		if (label == FutureChargingActivityLabel.HOME && !homeCharger) {
+			double probability = mandatory ? 1.0
+					: futureChargingBehaviourModel.computeChargingProbability(behaviourAgent, futureActivity);
+			futureChargingBehaviourModel.recordLatentDemandGenerated(groupType, personId, mandatory);
+			recordPendingLatentCharging(event, personId, vehicleId, groupType, label, activityType, now, band, soc,
+					probability, mandatory, FutureChargingSupplyType.FAST,
+					futureChargingBehaviourModel.computeOpportunityValue(groupType, futureActivity));
+			return;
+		}
 		var decision = futureChargingBehaviourModel.makeLatentPublicDemandDecision(behaviourAgent, futureActivity,
 				MatsimRandom.getLocalInstance());
 		if (!decision.willCharge() || !futureChargingBehaviourModel.isLatentDemandSupplyType(decision.getSupplyType())) {
 			return;
 		}
 		futureChargingBehaviourModel.recordLatentDemandGenerated(groupType, personId, decision.isMandatory());
+		recordPendingLatentCharging(event, personId, vehicleId, groupType, label, activityType, now, band, soc,
+				decision.getProbability(), decision.isMandatory(), decision.getSupplyType(),
+				decision.getOpportunityValue());
+	}
+
+	private void recordPendingLatentCharging(ActivityStartEvent event, Id<Person> personId, Id<Vehicle> vehicleId,
+			GroupType groupType, FutureChargingActivityLabel label, String activityType, double now, TimeBand band,
+			double soc, double probability, boolean mandatory, FutureChargingSupplyType supplyType,
+			double opportunityValue) {
 		Id<Link> linkId = event.getLinkId();
 		pendingLatentChargingByPerson.put(personId,
 				new PendingLatentCharging(
@@ -1367,10 +1385,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 						now,
 						band,
 						soc,
-						decision.getProbability(),
-						decision.isMandatory(),
-						decision.getSupplyType(),
-						decision.getOpportunityValue()));
+						probability,
+						mandatory,
+						supplyType,
+						opportunityValue));
 		chargedVehiclesToday.add(vehicleId);
 		latentPublicDemandRecordedToday.add(vehicleId);
 	}

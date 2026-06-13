@@ -100,7 +100,7 @@ public class FutureChargingActivitySelectionTest {
 
 		FutureChargingBehaviourParameters parameters = FutureChargingBehaviourParameters.createDefault();
 		var group = parameters.getGroupParameters(GroupType.APARTMENT);
-		group.setRealFrequency(0.99);
+		group.setRealFrequency(0.001);
 		group.setLambda(0.0);
 
 		FutureChargingBehaviourModel model = new FutureChargingBehaviourModel(cfg, parameters);
@@ -129,6 +129,8 @@ public class FutureChargingActivitySelectionTest {
 		assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
 		assertEquals("HOME", record.activityLabel().name());
 		assertEquals("HOME_ADJACENT_CONDITIONAL_DEMAND", record.demandType());
+		assertTrue(record.probability() < 0.01,
+				"HOME without a charger must map to PFC after HOME is selected, not pass through a second draw.");
 		assertFalse(record.socUpdated());
 		assertTrue(record.energyDemand() > 0.0);
 		assertTrue(record.demandDuration() > 0.0);
