@@ -1160,6 +1160,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 		double initialSoc = Math.max(0.0, Math.min(1.0, vehicle.getBattery().getCharge() / capacity));
 		Map<Activity, Double> socEstimates = estimateSocAtActivities(plan, vehicle);
+		Map<Activity, Double> activityDurations = estimateActivityDurations(plan);
 		Set<Activity> activityBasedChargingCandidateStarts = hasHomeCharger
 				? findActivityBasedChargingCandidateStarts(plan)
 				: Collections.emptySet();
@@ -1188,30 +1189,45 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			ChargingSlot homeSlot = null;
 
 			if (label == FutureChargingActivityLabel.HOME) {
-				if (!hasHomeCharger) {
+				if (plan.getPlanElements().indexOf(activity) == 0) {
 					continue;
 				}
-				homeSlot = homeSlots.get(activity);
-				if (homeSlot == null) {
-					if (plan.getPlanElements().indexOf(activity) == 0 || !activityBasedChargingCandidateStarts.contains(activity)) {
+				if (hasHomeCharger) {
+					homeSlot = homeSlots.get(activity);
+					if (homeSlot == null) {
+						if (!activityBasedChargingCandidateStarts.contains(activity)) {
+							continue;
+						}
+						Charger charger = findHomeChargerForPerson(plan.getPerson().getId(), activity);
+						if (charger == null) {
+							continue;
+						}
+						homeSlot = new ChargingSlot(activity, activity, charger);
+					}
+					feasible = EnumSet.of(FutureChargingSupplyType.HOME);
+				} else {
+					double activityDuration = activityDurations.getOrDefault(activity, estimateActivityDuration(activity));
+					feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, false, false,
+							estimatedSoc, activityDuration);
+					FutureChargingActivity probe = new FutureChargingActivity(label,
+							determineTimeBand(estimateActivityTime(activity)), estimatedSoc, null, feasible);
+					boolean mandatory = futureChargingBehaviourModel.isMandatoryCharging(probe);
+					feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, false, mandatory,
+							estimatedSoc, activityDuration);
+					if (feasible.isEmpty()) {
 						continue;
 					}
-					Charger charger = findHomeChargerForPerson(plan.getPerson().getId(), activity);
-					if (charger == null) {
-						continue;
-					}
-					homeSlot = new ChargingSlot(activity, activity, charger);
 				}
-				feasible = EnumSet.of(FutureChargingSupplyType.HOME);
 			} else {
 				hasNonHomeCandidate = true;
-				feasible = createLatentFeasibleSupplyTypes(plan, activity, label, hasHomeCharger, false,
-						estimatedSoc);
+				double activityDuration = activityDurations.getOrDefault(activity, estimateActivityDuration(activity));
+				feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, hasHomeCharger, false,
+						estimatedSoc, activityDuration);
 				FutureChargingActivity probe = new FutureChargingActivity(label,
 						determineTimeBand(estimateActivityTime(activity)), estimatedSoc, null, feasible);
 				boolean mandatory = futureChargingBehaviourModel.isMandatoryCharging(probe);
-				feasible = createLatentFeasibleSupplyTypes(plan, activity, label, hasHomeCharger, mandatory,
-						estimatedSoc);
+				feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, hasHomeCharger, mandatory,
+						estimatedSoc, activityDuration);
 				if (feasible.isEmpty()) {
 					continue;
 				}
@@ -1317,7 +1333,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		boolean homeCharger = hasHomeCharger(person);
 		String activityType = currentActivity.getType();
 		FutureChargingActivityLabel label = FutureChargingActivityLabel.fromActivityType(activityType);
-		if (label == FutureChargingActivityLabel.HOME) {
+		if (label == FutureChargingActivityLabel.HOME && homeCharger) {
 			return;
 		}
 		futureChargingBehaviourModel.recordLatentDemandPreferredReached(groupType, personId);
@@ -1386,7 +1402,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 						pending.mandatory(),
 						pending.supplyType(),
 						pending.opportunityValue(),
-						pending.mandatory() ? "MANDATORY_FEASIBILITY" : "CONDITIONAL_DEMAND",
+						createLatentDemandType(pending),
 						chargingUpdate.socUpdated(),
 						chargingUpdate.demandDuration(),
 						chargingUpdate.energyDemand(),
@@ -1397,6 +1413,15 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		if (chargingUpdate.socUpdated()) {
 			futureChargingBehaviourModel.recordLatentDemandSocUpdated(pending.group(), pending.personId());
 		}
+	}
+
+	private String createLatentDemandType(PendingLatentCharging pending) {
+		String demandType = pending.mandatory() ? "MANDATORY_FEASIBILITY" : "CONDITIONAL_DEMAND";
+		if (pending.activityLabel() == FutureChargingActivityLabel.HOME
+				&& pending.supplyType() == FutureChargingSupplyType.FAST) {
+			return "HOME_ADJACENT_" + demandType;
+		}
+		return demandType;
 	}
 
 	private record PendingLatentCharging(Id<Person> personId, Id<Vehicle> vehicleId, GroupType group,
@@ -1456,13 +1481,30 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 	private EnumSet<FutureChargingSupplyType> createLatentFeasibleSupplyTypes(Plan plan, Activity activity,
 			FutureChargingActivityLabel label, boolean hasHomeCharger, boolean mandatory, double now, double soc) {
+		return createLatentFeasibleSupplyTypesForDuration(plan, activity, label, hasHomeCharger, mandatory, soc,
+				estimateActivityDuration(activity, now));
+	}
+
+	private EnumSet<FutureChargingSupplyType> createLatentFeasibleSupplyTypesForDuration(Plan plan, Activity activity,
+			FutureChargingActivityLabel label, boolean hasHomeCharger, boolean mandatory, double soc,
+			double activityDuration) {
 		if (futureChargingBehaviourModel == null) {
 			return EnumSet.noneOf(FutureChargingSupplyType.class);
 		}
 		if (label == FutureChargingActivityLabel.HOME) {
-			return EnumSet.noneOf(FutureChargingSupplyType.class);
+			if (hasHomeCharger) {
+				return EnumSet.noneOf(FutureChargingSupplyType.class);
+			}
+			boolean fastLocationEligible = mandatory
+					|| futureChargingBehaviourModel.hasLatentPublicFastCandidateNear(
+							PopulationUtils.decideOnCoordForActivity(activity, scenario));
+			boolean fastSocEligible = mandatory || !Double.isFinite(soc)
+					|| soc <= futureChargingBehaviourModel.getMaximumLatentPublicFastSoc();
+			boolean fastEligible = mandatory || (fastLocationEligible && fastSocEligible
+					&& activityDuration >= futureChargingBehaviourModel.getMinimumLatentFastChargingDuration());
+			return fastEligible ? EnumSet.of(FutureChargingSupplyType.FAST)
+					: EnumSet.noneOf(FutureChargingSupplyType.class);
 		}
-		double activityDuration = estimateActivityDuration(activity, now);
 		boolean fastLocationEligible = mandatory
 				|| futureChargingBehaviourModel.hasLatentPublicFastCandidateNear(
 						PopulationUtils.decideOnCoordForActivity(activity, scenario));
@@ -1498,6 +1540,43 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		return feasible;
 	}
 
+	private Map<Activity, Double> estimateActivityDurations(Plan plan) {
+		if (plan == null) {
+			return Collections.emptyMap();
+		}
+
+		Map<Activity, Double> durations = new IdentityHashMap<>();
+		double currentTime = 0.0;
+		for (PlanElement element : plan.getPlanElements()) {
+			if (element instanceof Activity activity) {
+				double startTime = activity.getStartTime().isDefined() ? activity.getStartTime().seconds()
+						: currentTime;
+				double endTime = Double.NaN;
+				if (activity.getEndTime().isDefined()) {
+					endTime = activity.getEndTime().seconds();
+				} else if (activity.getMaximumDuration().isDefined()) {
+					endTime = startTime + activity.getMaximumDuration().seconds();
+				}
+				if (Double.isFinite(endTime)) {
+					durations.put(activity, Math.max(0.0, endTime - startTime));
+					currentTime = Math.max(currentTime, endTime);
+				} else {
+					durations.put(activity, 0.0);
+					currentTime = Math.max(currentTime, startTime);
+				}
+			} else if (element instanceof Leg leg) {
+				double departureTime = leg.getDepartureTime().isDefined() ? leg.getDepartureTime().seconds()
+						: currentTime;
+				currentTime = Math.max(currentTime, departureTime);
+				double travelTime = estimateLegTravelTime(leg);
+				if (Double.isFinite(travelTime) && travelTime > 0.0) {
+					currentTime += travelTime;
+				}
+			}
+		}
+		return durations;
+	}
+
 	private double estimateActivityDuration(Activity activity) {
 		return estimateActivityDuration(activity, Double.NaN);
 	}
@@ -1520,6 +1599,22 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			return Math.max(0.0, maximumDuration.seconds());
 		}
 		return 0.0;
+	}
+
+	private double estimateLegTravelTime(Leg leg) {
+		if (leg == null) {
+			return Double.NaN;
+		}
+		if (leg.getTravelTime().isDefined()) {
+			return leg.getTravelTime().seconds();
+		}
+		if (leg.getRoute() != null) {
+			OptionalTime routeTravelTime = leg.getRoute().getTravelTime();
+			if (routeTravelTime.isDefined()) {
+				return routeTravelTime.seconds();
+			}
+		}
+		return Double.NaN;
 	}
 
 	private boolean hasLatentService(Plan plan, Activity activity, FutureChargingSupplyType supplyType,

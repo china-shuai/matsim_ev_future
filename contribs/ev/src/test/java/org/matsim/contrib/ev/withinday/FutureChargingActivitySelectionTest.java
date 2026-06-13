@@ -77,6 +77,64 @@ public class FutureChargingActivitySelectionTest {
 	}
 
 	@Test
+	public void testNoHomeChargerPreferredHomeCreatesHomeAdjacentFastDemand() {
+		TestScenario scenario = new TestScenarioBuilder(utils)
+				.setElectricVehicleRange(100_000.0)
+				.addPerson("person", 0.8)
+				.addActivity("home", 0, 0, 8.0 * 3600.0)
+				.addActivity("work", 3, 3, 8.1 * 3600.0)
+				.addActivity("home", 0, 0, 20.0 * 3600.0)
+				.addActivity("work", 3, 3)
+				.build();
+
+		var person = scenario.scenario().getPopulation().getPersons().get(Id.createPersonId("person"));
+		person.getAttributes().putAttribute(WithinDayEvEngine.DWELLING_TYPE_ATTRIBUTE, "apartment");
+		person.getAttributes().putAttribute(WithinDayEvEngine.HOME_CHARGER_ATTRIBUTE, false);
+
+		FutureChargingBehaviourConfigGroup cfg = new FutureChargingBehaviourConfigGroup();
+		cfg.setLatentPublicDemand(true);
+		cfg.setUnrestrictedLatentPublicDemand(true);
+		cfg.setMinimumSoc(0.0);
+		cfg.setMinimumLatentFastChargingDuration(1800.0);
+		cfg.setMaximumLatentPublicFastSoc(1.0);
+
+		FutureChargingBehaviourParameters parameters = FutureChargingBehaviourParameters.createDefault();
+		var group = parameters.getGroupParameters(GroupType.APARTMENT);
+		group.setRealFrequency(0.99);
+		group.setLambda(0.0);
+
+		FutureChargingBehaviourModel model = new FutureChargingBehaviourModel(cfg, parameters);
+		var controler = scenario.controller();
+		controler.addOverridingModule(new AbstractModule() {
+			@Override
+			public void install() {
+				bind(FutureChargingBehaviourModel.class).toInstance(model);
+			}
+		});
+		controler.addOverridingQSimModule(new AbstractQSimModule() {
+			@Override
+			protected void configureQSim() {
+				bind(ChargingSlotProvider.class).to(NoPreplannedSlotProvider.class);
+				bind(ChargingDecisionStrategy.class).toInstance(new FutureChargingDecisionStrategy(model));
+			}
+		});
+
+		controler.run();
+
+		assertEquals(0, scenario.tracker().startChargingProcessEvents.size(),
+				"Home-adjacent PFC demand is latent and must not create a private HOME charging process.");
+		var records = model.consumeLatentPublicDemandRecords();
+		assertEquals(1, records.size());
+		var record = records.getFirst();
+		assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
+		assertEquals("HOME", record.activityLabel().name());
+		assertEquals("HOME_ADJACENT_CONDITIONAL_DEMAND", record.demandType());
+		assertFalse(record.socUpdated());
+		assertTrue(record.energyDemand() > 0.0);
+		assertTrue(record.demandDuration() > 0.0);
+	}
+
+	@Test
 	public void testPreferredLatentNonHomeActivitySuppressesHomeCharging() {
 		TestRun run = runFutureScenario(false);
 
@@ -149,10 +207,10 @@ public class FutureChargingActivitySelectionTest {
 		person.getAttributes().putAttribute(WithinDayEvEngine.DWELLING_TYPE_ATTRIBUTE, "house_with_pv");
 		person.getAttributes().putAttribute(WithinDayEvEngine.HOME_CHARGER_ATTRIBUTE, true);
 
-        FutureChargingBehaviourConfigGroup cfg = new FutureChargingBehaviourConfigGroup();
-        cfg.setLatentPublicDemand(true);
-        cfg.setUnrestrictedLatentPublicDemand(true);
-        cfg.setMinimumSoc(minimumSoc);
+		FutureChargingBehaviourConfigGroup cfg = new FutureChargingBehaviourConfigGroup();
+		cfg.setLatentPublicDemand(true);
+		cfg.setUnrestrictedLatentPublicDemand(true);
+		cfg.setMinimumSoc(minimumSoc);
 		cfg.setMinimumLatentFastChargingDuration(0.0);
 		cfg.setMaximumLatentPublicFastSoc(1.0);
 
