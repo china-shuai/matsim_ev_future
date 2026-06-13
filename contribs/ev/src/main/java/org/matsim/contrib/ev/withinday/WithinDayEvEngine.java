@@ -1400,9 +1400,12 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			return;
 		}
 		pendingLatentChargingByPerson.remove(event.getPersonId());
+		completeLatentCharging(pending, event.getTime());
+	}
 
+	private void completeLatentCharging(PendingLatentCharging pending, double endTime) {
 		ElectricVehicle vehicle = electricFleet.getElectricVehicles().get(pending.vehicleId());
-		LatentChargingUpdate chargingUpdate = calculateLatentCharging(vehicle, event.getTime() - pending.startTime(),
+		LatentChargingUpdate chargingUpdate = calculateLatentCharging(vehicle, endTime - pending.startTime(),
 				pending.supplyType(), pending.mandatory());
 
 		futureChargingBehaviourModel.recordLatentPublicDemand(
@@ -2490,6 +2493,16 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 	@Override
 	public void afterSim() {
+		if (pendingLatentChargingByPerson.isEmpty()) {
+			return;
+		}
+		double endTime = Math.max(SECONDS_PER_DAY, internalInterface.getMobsim().getSimTimer().getTimeOfDay());
+		for (PendingLatentCharging pending : List.copyOf(pendingLatentChargingByPerson.values())) {
+			if (endTime >= pending.startTime()) {
+				completeLatentCharging(pending, endTime);
+			}
+		}
+		pendingLatentChargingByPerson.clear();
 	}
 
 	private InternalInterface internalInterface;

@@ -137,6 +137,67 @@ public class FutureChargingActivitySelectionTest {
 	}
 
 	@Test
+	public void testPendingHomeAdjacentFastDemandIsFlushedAfterSim() {
+		TestScenario scenario = new TestScenarioBuilder(utils)
+				.setElectricVehicleRange(100_000.0)
+				.setSimulationEndTime(12.0 * 3600.0)
+				.addPerson("person", 0.8)
+				.addActivity("home", 0, 0, 8.0 * 3600.0)
+				.addActivity("work", 3, 3, 8.1 * 3600.0)
+				.addActivity("home", 0, 0)
+				.build();
+
+		var person = scenario.scenario().getPopulation().getPersons().get(Id.createPersonId("person"));
+		person.getAttributes().putAttribute(WithinDayEvEngine.DWELLING_TYPE_ATTRIBUTE, "apartment");
+		person.getAttributes().putAttribute(WithinDayEvEngine.HOME_CHARGER_ATTRIBUTE, false);
+		var finalHome = person.getSelectedPlan().getPlanElements().stream()
+				.filter(Activity.class::isInstance)
+				.map(Activity.class::cast)
+				.reduce((first, second) -> second)
+				.orElseThrow();
+		finalHome.setMaximumDuration(48.0 * 3600.0);
+
+		FutureChargingBehaviourConfigGroup cfg = new FutureChargingBehaviourConfigGroup();
+		cfg.setLatentPublicDemand(true);
+		cfg.setUnrestrictedLatentPublicDemand(true);
+		cfg.setMinimumSoc(0.0);
+		cfg.setMinimumLatentFastChargingDuration(1800.0);
+		cfg.setMaximumLatentPublicFastSoc(1.0);
+
+		FutureChargingBehaviourParameters parameters = FutureChargingBehaviourParameters.createDefault();
+		var group = parameters.getGroupParameters(GroupType.APARTMENT);
+		group.setRealFrequency(0.001);
+		group.setLambda(0.0);
+
+		FutureChargingBehaviourModel model = new FutureChargingBehaviourModel(cfg, parameters);
+		var controler = scenario.controller();
+		controler.addOverridingModule(new AbstractModule() {
+			@Override
+			public void install() {
+				bind(FutureChargingBehaviourModel.class).toInstance(model);
+			}
+		});
+		controler.addOverridingQSimModule(new AbstractQSimModule() {
+			@Override
+			protected void configureQSim() {
+				bind(ChargingSlotProvider.class).to(NoPreplannedSlotProvider.class);
+				bind(ChargingDecisionStrategy.class).toInstance(new FutureChargingDecisionStrategy(model));
+			}
+		});
+
+		controler.run();
+
+		var records = model.consumeLatentPublicDemandRecords();
+		assertEquals(1, records.size(),
+				"Latent demand on a final HOME activity must be flushed after mobsim even without ActivityEndEvent.");
+		var record = records.getFirst();
+		assertEquals("HOME_ADJACENT_CONDITIONAL_DEMAND", record.demandType());
+		assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
+		assertTrue(record.demandDuration() > 0.0);
+		assertTrue(record.energyDemand() > 0.0);
+	}
+
+	@Test
 	public void testPreferredLatentNonHomeActivitySuppressesHomeCharging() {
 		TestRun run = runFutureScenario(false);
 
