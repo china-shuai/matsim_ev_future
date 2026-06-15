@@ -31,10 +31,12 @@ public final class FutureChargingBehaviourModel {
 	private final double baseLearningRate;
 	private final double learningRateDecay;
 	private final double minimumSoc;
+	private final double activitySelectionTemperature;
 	private final double acReferencePower;
 	private final double dcfcReferencePower;
 	private final boolean workplaceChargingAvailable;
 	private final boolean destinationChargingAvailable;
+	private final EnumSet<FutureChargingActivityLabel> destinationChargingActivityLabels;
 	private final boolean publicFastFallback;
 	private final boolean latentPublicDemand;
 	private final boolean unrestrictedLatentPublicDemand;
@@ -59,10 +61,12 @@ public final class FutureChargingBehaviourModel {
 		this.baseLearningRate = cfg.getLearningRate();
 		this.learningRateDecay = cfg.getLearningRateDecay();
 		this.minimumSoc = cfg.getMinimumSoc();
+		this.activitySelectionTemperature = cfg.getActivitySelectionTemperature();
 		this.acReferencePower = cfg.getAcReferencePower();
 		this.dcfcReferencePower = cfg.getDcfcReferencePower();
 		this.workplaceChargingAvailable = cfg.isWorkplaceChargingAvailable();
 		this.destinationChargingAvailable = cfg.isDestinationChargingAvailable();
+		this.destinationChargingActivityLabels = cfg.getDestinationChargingActivityLabels();
 		this.publicFastFallback = cfg.isPublicFastFallback();
 		this.latentPublicDemand = cfg.isLatentPublicDemand();
 		this.unrestrictedLatentPublicDemand = cfg.isUnrestrictedLatentPublicDemand();
@@ -103,13 +107,21 @@ public final class FutureChargingBehaviourModel {
 			return 1.0;
 		}
 
+		return clipProbability(invLogit(computeChargingUtility(agent, act)));
+	}
+
+	public double computeChargingUtility(Agent agent, FutureChargingActivity act) {
+		Objects.requireNonNull(agent, "agent");
+		Objects.requireNonNull(act, "act");
+
+		double soc = clip01(act.getSocOnArrival());
 		GroupConfig config = configs.get(agent.getGroup());
 		double utility = config.getEta() + config.getLambda() * (1.0 - soc);
 		if (agent.hasHomeCharger()) {
 			utility += act.isHome() ? config.getRhoHome() : config.getRhoAway();
 		}
 		utility += config.getTimePreference(act.getTimeBand());
-		return clipProbability(invLogit(utility));
+		return utility;
 	}
 
 	public FutureChargingDecision makeChargingDecision(Agent agent, FutureChargingActivity act, Random rng) {
@@ -172,6 +184,10 @@ public final class FutureChargingBehaviourModel {
 		return latentDestinationServiceRate;
 	}
 
+	public boolean isDestinationChargingActivity(FutureChargingActivityLabel label) {
+		return destinationChargingActivityLabels.contains(label);
+	}
+
 	public double getMinimumLatentActivityChargingDuration() {
 		return minimumLatentActivityChargingDuration;
 	}
@@ -190,6 +206,10 @@ public final class FutureChargingBehaviourModel {
 
 	public double getLatentPublicFastSearchRadius() {
 		return latentPublicFastSearchRadius;
+	}
+
+	public double getActivitySelectionTemperature() {
+		return activitySelectionTemperature;
 	}
 
 	public synchronized void recordLatentPublicDemand(LatentPublicDemandRecord record) {
@@ -215,6 +235,10 @@ public final class FutureChargingBehaviourModel {
 		int bin = Math.min(PUBLIC_START_SOC_BINS - 1,
 				Math.max(0, (int) Math.floor(clip01(soc) * PUBLIC_START_SOC_BINS)));
 		return publicStartSocWeights[bin];
+	}
+
+	public double adjustLatentFastStartProbability(double probability, FutureChargingActivity act, boolean mandatory) {
+		return adjustLatentStartProbability(probability, FutureChargingSupplyType.FAST, act, mandatory);
 	}
 
 	public void setLatentPublicFastCandidates(List<Coord> candidates) {
@@ -294,8 +318,8 @@ public final class FutureChargingBehaviourModel {
 					feasible.add(FutureChargingSupplyType.FAST);
 				}
 			}
-			case SHOP -> {
-				if (destinationChargingAvailable) {
+			case SHOP, STUDY, SOCIAL_RECREATIONAL, OTHER, PERSONAL, PICKUP_DROPOFF_DELIVER, WITH_SOMEONE -> {
+				if (isDestinationChargingActivity(label) && destinationChargingAvailable) {
 					feasible.add(FutureChargingSupplyType.DESTINATION);
 				}
 				if (publicFastFallback) {

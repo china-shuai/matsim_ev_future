@@ -676,6 +676,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 	private record AdaptationResult(ChargingSlot slot, Activity plugActivity, boolean proceed, boolean replanned) {
 	}
 
+	private record FutureActivityCandidate(Activity activity, ChargingSlot homeSlot, double probability, double utility) {
+	}
+
 	private DecisionOutcome evaluateChargingDecision(Id<Person> personId, MobsimAgent agent, Plan plan,
 			ChargingSlot slot,
 			Activity plugActivity, double now) {
@@ -1166,6 +1169,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				: Collections.emptySet();
 		Agent behaviourAgent = new Agent(groupType, hasHomeCharger, plan.getPerson().getId());
 
+		List<FutureActivityCandidate> optionalCandidates = new ArrayList<>();
 		Activity bestActivity = null;
 		ChargingSlot bestHomeSlot = null;
 		double bestProbability = Double.NEGATIVE_INFINITY;
@@ -1242,6 +1246,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				firstMandatoryActivity = activity;
 				firstMandatoryHomeSlot = homeSlot;
 			}
+			if (!mandatory) {
+				double utility = futureChargingBehaviourModel.computeChargingUtility(behaviourAgent, futureActivity);
+				optionalCandidates.add(new FutureActivityCandidate(activity, homeSlot, probability, utility));
+			}
 			if (probability > bestProbability) {
 				bestProbability = probability;
 				bestActivity = activity;
@@ -1257,8 +1265,13 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			futureChargingBehaviourModel.recordLatentDemandEligibleNonHome(groupType, personId);
 		}
 
-		Activity selectedActivity = firstMandatoryActivity != null ? firstMandatoryActivity : bestActivity;
-		ChargingSlot selectedHomeSlot = firstMandatoryActivity != null ? firstMandatoryHomeSlot : bestHomeSlot;
+		FutureActivityCandidate sampledCandidate = firstMandatoryActivity == null
+				? sampleFutureActivityCandidate(optionalCandidates, bestActivity, bestHomeSlot)
+				: null;
+		Activity selectedActivity = firstMandatoryActivity != null ? firstMandatoryActivity
+				: sampledCandidate != null ? sampledCandidate.activity : bestActivity;
+		ChargingSlot selectedHomeSlot = firstMandatoryActivity != null ? firstMandatoryHomeSlot
+				: sampledCandidate != null ? sampledCandidate.homeSlot : bestHomeSlot;
 		if (selectedActivity == null) {
 			return;
 		}
@@ -1269,6 +1282,49 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			preferredLatentPublicActivityByVehicle.put(vehicleId, selectedActivity);
 			futureChargingBehaviourModel.recordLatentDemandPreferredSelected(groupType, personId);
 		}
+	}
+
+	private FutureActivityCandidate sampleFutureActivityCandidate(List<FutureActivityCandidate> candidates,
+			Activity fallbackActivity, ChargingSlot fallbackHomeSlot) {
+		if (candidates.isEmpty()) {
+			return fallbackActivity == null ? null
+					: new FutureActivityCandidate(fallbackActivity, fallbackHomeSlot, 0.0, Double.NaN);
+		}
+		if (candidates.size() == 1) {
+			return candidates.get(0);
+		}
+		double temperature = futureChargingBehaviourModel.getActivitySelectionTemperature();
+		if (temperature <= 0.0) {
+			return fallbackActivity == null ? candidates.get(0)
+					: new FutureActivityCandidate(fallbackActivity, fallbackHomeSlot, 0.0, Double.NaN);
+		}
+		double maxScaledUtility = Double.NEGATIVE_INFINITY;
+		for (FutureActivityCandidate candidate : candidates) {
+			double scaledUtility = candidate.utility / temperature;
+			if (scaledUtility > maxScaledUtility) {
+				maxScaledUtility = scaledUtility;
+			}
+		}
+		double sum = 0.0;
+		double[] weights = new double[candidates.size()];
+		for (int i = 0; i < candidates.size(); i++) {
+			double weight = Math.exp(candidates.get(i).utility / temperature - maxScaledUtility);
+			weights[i] = weight;
+			sum += weight;
+		}
+		if (!Double.isFinite(sum) || sum <= 0.0) {
+			return fallbackActivity == null ? candidates.get(0)
+					: new FutureActivityCandidate(fallbackActivity, fallbackHomeSlot, 0.0, Double.NaN);
+		}
+		double draw = MatsimRandom.getLocalInstance().nextDouble() * sum;
+		double cumulative = 0.0;
+		for (int i = 0; i < candidates.size(); i++) {
+			cumulative += weights[i];
+			if (draw <= cumulative) {
+				return candidates.get(i);
+			}
+		}
+		return candidates.get(candidates.size() - 1);
 	}
 
 	private Set<Activity> findActivityBasedChargingCandidateStarts(Plan plan) {
@@ -1352,6 +1408,11 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		if (label == FutureChargingActivityLabel.HOME && !homeCharger) {
 			double probability = mandatory ? 1.0
 					: futureChargingBehaviourModel.computeChargingProbability(behaviourAgent, futureActivity);
+			probability = futureChargingBehaviourModel.adjustLatentFastStartProbability(probability, futureActivity,
+					mandatory);
+			if (!mandatory && MatsimRandom.getLocalInstance().nextDouble() >= probability) {
+				return;
+			}
 			futureChargingBehaviourModel.recordLatentDemandGenerated(groupType, personId, mandatory);
 			recordPendingLatentCharging(event, personId, vehicleId, groupType, label, activityType, now, band, soc,
 					probability, mandatory, FutureChargingSupplyType.FAST,
@@ -1554,8 +1615,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				FutureChargingSupplyType.WORKPLACE, futureChargingBehaviourModel.getLatentWorkplaceServiceRate())) {
 			feasible.add(FutureChargingSupplyType.WORKPLACE);
 		}
-		if (activityChargingEligible && label == FutureChargingActivityLabel.SHOP && hasLatentService(plan, activity,
-				FutureChargingSupplyType.DESTINATION, futureChargingBehaviourModel.getLatentDestinationServiceRate())) {
+		if (activityChargingEligible && futureChargingBehaviourModel.isDestinationChargingActivity(label)
+				&& hasLatentService(plan, activity, FutureChargingSupplyType.DESTINATION,
+						futureChargingBehaviourModel.getLatentDestinationServiceRate())) {
 			feasible.add(FutureChargingSupplyType.DESTINATION);
 		}
 		return feasible;

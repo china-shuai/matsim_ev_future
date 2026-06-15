@@ -1,6 +1,7 @@
 package org.matsim.contrib.ev.withinday;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.EnumSet;
@@ -81,6 +82,11 @@ public class FutureChargingBehaviourModelTest {
 				.isEmpty());
 		assertTrue(specificAccessModel.createFeasiblePublicSupplyTypes(FutureChargingActivityLabel.SHOP, false, false)
 				.isEmpty());
+		assertTrue(specificAccessModel
+				.createFeasiblePublicSupplyTypes(FutureChargingActivityLabel.SOCIAL_RECREATIONAL, false, false)
+				.isEmpty());
+		assertTrue(specificAccessModel
+				.createFeasiblePublicSupplyTypes(FutureChargingActivityLabel.PERSONAL, false, false).isEmpty());
 
 		FutureChargingBehaviourConfigGroup fallbackCfg = new FutureChargingBehaviourConfigGroup();
 		FutureChargingBehaviourModel fallbackModel = new FutureChargingBehaviourModel(fallbackCfg,
@@ -88,6 +94,35 @@ public class FutureChargingBehaviourModelTest {
 
 		assertEquals(EnumSet.of(FutureChargingSupplyType.FAST),
 				fallbackModel.createFeasiblePublicSupplyTypes(FutureChargingActivityLabel.HOME, false, false));
+	}
+
+	@Test
+	public void testDestinationChargingEligibleActivityLabels() {
+		FutureChargingBehaviourConfigGroup cfg = new FutureChargingBehaviourConfigGroup();
+		assertEquals(EnumSet.of(FutureChargingActivityLabel.SHOP, FutureChargingActivityLabel.SOCIAL_RECREATIONAL,
+				FutureChargingActivityLabel.PERSONAL), cfg.getDestinationChargingActivityLabels());
+
+		cfg.setDestinationChargingAvailable(true);
+		FutureChargingBehaviourModel model = new FutureChargingBehaviourModel(cfg,
+				FutureChargingBehaviourParameters.createDefault());
+		assertTrue(model.createFeasibleSupplyTypes(FutureChargingActivityLabel.SHOP, false, false)
+				.contains(FutureChargingSupplyType.DESTINATION));
+		assertTrue(model.createFeasibleSupplyTypes(FutureChargingActivityLabel.SOCIAL_RECREATIONAL, false, false)
+				.contains(FutureChargingSupplyType.DESTINATION));
+		assertTrue(model.createFeasibleSupplyTypes(FutureChargingActivityLabel.PERSONAL, false, false)
+				.contains(FutureChargingSupplyType.DESTINATION));
+		assertFalse(model.createFeasibleSupplyTypes(FutureChargingActivityLabel.STUDY, false, false)
+				.contains(FutureChargingSupplyType.DESTINATION));
+		assertFalse(model.createFeasibleSupplyTypes(FutureChargingActivityLabel.WORK, false, false)
+				.contains(FutureChargingSupplyType.DESTINATION));
+
+		cfg.setDestinationChargingActivityTypes("Shop");
+		FutureChargingBehaviourModel shopOnlyModel = new FutureChargingBehaviourModel(cfg,
+				FutureChargingBehaviourParameters.createDefault());
+		assertTrue(shopOnlyModel.createFeasibleSupplyTypes(FutureChargingActivityLabel.SHOP, false, false)
+				.contains(FutureChargingSupplyType.DESTINATION));
+		assertFalse(shopOnlyModel.createFeasibleSupplyTypes(FutureChargingActivityLabel.PERSONAL, false, false)
+				.contains(FutureChargingSupplyType.DESTINATION));
 	}
 
 	@Test

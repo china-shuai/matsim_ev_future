@@ -3,6 +3,7 @@ package org.matsim.contrib.ev.behavior;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.List;
 
 import org.matsim.core.config.ReflectiveConfigGroup;
@@ -12,6 +13,7 @@ import org.matsim.core.config.ReflectiveConfigGroup;
  */
 public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	public static final String GROUP_NAME = "futureChargingBehaviour";
+	public static final String DEFAULT_DESTINATION_CHARGING_ACTIVITY_TYPES = "Shop,Social/Recreational,Personal";
 
 	private final EnumMap<GroupType, Double> lambdas = new EnumMap<>(GroupType.class);
 	private final EnumMap<GroupType, Double> rhoHome = new EnumMap<>(GroupType.class);
@@ -23,10 +25,12 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	private int startCalibrationIteration = 0;
 	private double minimumSoc = 0.2;
 	private double thetaOmega = 1.0;
+	private double activitySelectionTemperature = 0.0;
 	private double acReferencePowerKw = 22.0;
 	private double dcfcReferencePowerKw = 250.0;
 	private boolean workplaceChargingAvailable = false;
 	private boolean destinationChargingAvailable = false;
+	private String destinationChargingActivityTypes = DEFAULT_DESTINATION_CHARGING_ACTIVITY_TYPES;
 	private boolean publicFastFallback = true;
 	private boolean latentPublicDemand = false;
 	private boolean unrestrictedLatentPublicDemand = false;
@@ -108,6 +112,16 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 		this.thetaOmega = thetaOmega;
 	}
 
+	@StringGetter("activitySelectionTemperature")
+	public double getActivitySelectionTemperature() {
+		return activitySelectionTemperature;
+	}
+
+	@StringSetter("activitySelectionTemperature")
+	public void setActivitySelectionTemperature(double activitySelectionTemperature) {
+		this.activitySelectionTemperature = Math.max(0.0, activitySelectionTemperature);
+	}
+
 	public double getAcReferencePower() {
 		return acReferencePowerKw * 1000.0;
 	}
@@ -164,6 +178,30 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	@StringSetter("destinationChargingAvailable")
 	public void setDestinationChargingAvailable(boolean destinationChargingAvailable) {
 		this.destinationChargingAvailable = destinationChargingAvailable;
+	}
+
+	@StringGetter("destinationChargingActivityTypes")
+	public String getDestinationChargingActivityTypes() {
+		return destinationChargingActivityTypes;
+	}
+
+	@StringSetter("destinationChargingActivityTypes")
+	public void setDestinationChargingActivityTypes(String destinationChargingActivityTypes) {
+		this.destinationChargingActivityTypes = destinationChargingActivityTypes == null ? ""
+				: destinationChargingActivityTypes.trim();
+	}
+
+	public EnumSet<FutureChargingActivityLabel> getDestinationChargingActivityLabels() {
+		EnumSet<FutureChargingActivityLabel> labels = EnumSet.noneOf(FutureChargingActivityLabel.class);
+		if (destinationChargingActivityTypes == null || destinationChargingActivityTypes.isBlank()) {
+			return labels;
+		}
+		for (String token : destinationChargingActivityTypes.split("[,;|]")) {
+			if (!token.isBlank()) {
+				labels.add(FutureChargingActivityLabel.fromActivityType(token.trim()));
+			}
+		}
+		return labels;
 	}
 
 	@StringGetter("publicFastFallback")
