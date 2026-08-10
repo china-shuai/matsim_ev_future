@@ -40,6 +40,8 @@ public final class FutureChargingBehaviourModel {
 	private final boolean publicFastFallback;
 	private final boolean latentPublicDemand;
 	private final boolean unrestrictedLatentPublicDemand;
+	private final boolean realizePublicCharging;
+	private final boolean limitChargingToOncePerDay;
 	private final double latentWorkplaceServiceRate;
 	private final double latentDestinationServiceRate;
 	private final double minimumLatentActivityChargingDuration;
@@ -70,6 +72,8 @@ public final class FutureChargingBehaviourModel {
 		this.publicFastFallback = cfg.isPublicFastFallback();
 		this.latentPublicDemand = cfg.isLatentPublicDemand();
 		this.unrestrictedLatentPublicDemand = cfg.isUnrestrictedLatentPublicDemand();
+		this.realizePublicCharging = cfg.isRealizePublicCharging();
+		this.limitChargingToOncePerDay = cfg.isLimitChargingToOncePerDay();
 		this.latentWorkplaceServiceRate = cfg.getLatentWorkplaceServiceRate();
 		this.latentDestinationServiceRate = cfg.getLatentDestinationServiceRate();
 		this.minimumLatentActivityChargingDuration = cfg.getMinimumLatentActivityChargingDuration();
@@ -161,6 +165,14 @@ public final class FutureChargingBehaviourModel {
 
 	public boolean isUnrestrictedLatentPublicDemand() {
 		return unrestrictedLatentPublicDemand;
+	}
+
+	public boolean isRealizePublicCharging() {
+		return realizePublicCharging;
+	}
+
+	public boolean isLimitChargingToOncePerDay() {
+		return limitChargingToOncePerDay;
 	}
 
 	public String getLatentPublicDemandFile() {

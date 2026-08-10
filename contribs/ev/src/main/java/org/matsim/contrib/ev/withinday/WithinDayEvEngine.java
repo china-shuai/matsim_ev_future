@@ -60,6 +60,7 @@ import org.matsim.contrib.ev.withinday.events.AbortChargingAttemptEvent;
 import org.matsim.contrib.ev.withinday.events.AbortChargingProcessEvent;
 import org.matsim.contrib.ev.withinday.events.FinishChargingAttemptEvent;
 import org.matsim.contrib.ev.withinday.events.FinishChargingProcessEvent;
+import org.matsim.contrib.ev.withinday.events.RealizedPublicChargingEvent;
 import org.matsim.contrib.ev.withinday.events.StartChargingAttemptEvent;
 import org.matsim.contrib.ev.withinday.events.StartChargingProcessEvent;
 import org.matsim.contrib.ev.withinday.events.UpdateChargingAttemptEvent;
@@ -193,6 +194,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 	private final IdSet<Vehicle> chargedVehiclesToday = new IdSet<>(Vehicle.class);
 	private final Map<Id<Vehicle>, ChargingSlot> preferredSlotByVehicle = new HashMap<>();
 	private final Map<Id<Vehicle>, Activity> preferredLatentPublicActivityByVehicle = new HashMap<>();
+	private final Map<Id<Vehicle>, List<ChargingSlot>> futureHomeSlotsByVehicle = new HashMap<>();
 	private final IdSet<Vehicle> latentPublicDemandRecordedToday = new IdSet<>(Vehicle.class);
 	private final IdMap<Person, PendingLatentCharging> pendingLatentChargingByPerson = new IdMap<>(Person.class);
 
@@ -208,6 +210,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		latentPublicDemandRecordedToday.clear();
 		preferredSlotByVehicle.clear();
 		preferredLatentPublicActivityByVehicle.clear();
+		futureHomeSlotsByVehicle.clear();
 		pendingLatentChargingByPerson.clear();
 		latentServiceSeedBase = MatsimRandom.getRandom().nextLong();
 
@@ -263,12 +266,25 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 					boolean unifiedFutureSelection = usesUnifiedFutureActivitySelection();
 					if (unifiedFutureSelection && vehicle != null && vehicle.getBattery() != null
 							&& vehicleId != null && hasChargingModeLeg(plan)) {
-						selectPreferredFutureActivity(plan, slots, vehicle, vehicleId, groupType, homeCharger);
-						ChargingSlot selectedHomeSlot = preferredSlotByVehicle.get(vehicleId);
-						if (selectedHomeSlot != null && !slots.contains(selectedHomeSlot)) {
-							slots.add(selectedHomeSlot);
+						if (futureChargingBehaviourModel.isLimitChargingToOncePerDay()) {
+							selectPreferredFutureActivity(plan, slots, vehicle, vehicleId, groupType, homeCharger);
+							ChargingSlot selectedHomeSlot = preferredSlotByVehicle.get(vehicleId);
+							if (selectedHomeSlot != null && !slots.contains(selectedHomeSlot)) {
+								slots.add(selectedHomeSlot);
+							}
+							slots.removeIf(slot -> slot != selectedHomeSlot);
+						} else {
+							// Strategic charging plans can contain overlapping, overnight, or whole-day
+							// slots because they were created for the legacy one-slot-per-day model.
+							// Build all HOME opportunities up front so a later dynamic re-selection can
+							// activate one without rewriting the plan during mobsim. Only the currently
+							// preferred HOME slot is allowed to start charging.
+							slots.clear();
+							ensureFutureHomeSlots(plan, slots, homeCharger);
+							futureHomeSlotsByVehicle.put(vehicleId, List.copyOf(slots));
+							selectPreferredFutureActivity(plan, slots, vehicle, vehicleId, groupType, homeCharger,
+									null);
 						}
-						slots.removeIf(slot -> slot != selectedHomeSlot);
 					} else if (chargingDecisionStrategy != null && vehicle != null && vehicle.getBattery() != null
 							&& vehicleId != null && !slots.isEmpty()) {
 						double initialSoc = vehicle.getBattery().getCapacity() > 0
@@ -695,7 +711,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		FutureChargingActivityLabel activityLabel = determineFutureActivityLabel(slot);
 
 		Id<Vehicle> vehicleId = VehicleUtils.getVehicleId(plan.getPerson(), chargingMode);
-		if (vehicleId != null && chargedVehiclesToday.contains(vehicleId)) {
+		if (vehicleId != null && (futureChargingBehaviourModel == null
+				|| futureChargingBehaviourModel.isLimitChargingToOncePerDay())
+				&& chargedVehiclesToday.contains(vehicleId)) {
 			logger.debug("Vehicle {} already charged earlier today. Skipping new charging attempt.", vehicleId);
 			recordChargingDecision(personId, vehicleId, groupType, homeCharger,
 					plugActivity != null ? plugActivity.getLinkId()
@@ -727,7 +745,17 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		ChargingDecisionContext ctx = new ChargingDecisionContext(groupType, homeCharger, plan.getPerson().getId(),
 				locationType, activityLabel, timeBand, soc, null);
 
-		if (vehicleId != null) {
+		if (vehicleId != null && futureChargingBehaviourModel != null
+				&& !futureChargingBehaviourModel.isLimitChargingToOncePerDay()) {
+			ChargingSlot preferredSlot = preferredSlotByVehicle.get(vehicleId);
+			if ((preferredSlot == null || !preferredSlot.equals(slot))
+					&& !chargingDecisionStrategy.isMandatoryCharging(ctx)) {
+				logger.debug("Vehicle {} skipping HOME slot because a different remaining activity is preferred.",
+						vehicleId);
+				skipChargingAtPlug(agent, plugActivity, now);
+				return null;
+			}
+		} else if (vehicleId != null) {
 			ChargingSlot preferredSlot = preferredSlotByVehicle.get(vehicleId);
 			if (preferredSlot != null && !preferredSlot.equals(slot)
 					&& !chargingDecisionStrategy.isMandatoryCharging(ctx)) {
@@ -748,6 +776,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 							: slot != null && slot.charger() != null ? slot.charger().getLink().getId() : null,
 					now, locationType, decision.getChargerType(), decision.getProbability(), false,
 					Outcome.MODEL_DECLINED, null);
+			if (isDynamicFutureSelection() && vehicleId != null) {
+				preferredSlotByVehicle.remove(vehicleId);
+				reselectFutureActivityAfter(agent, plan, vehicleId, slot.startActivity());
+			}
 			return null;
 		}
 
@@ -765,6 +797,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				}
 				if (!adaptation.proceed()) {
 					skipChargingAtPlug(agent, effectivePlugActivity, now);
+					if (isDynamicFutureSelection() && vehicleId != null) {
+						preferredSlotByVehicle.remove(vehicleId);
+						reselectFutureActivityAfter(agent, plan, vehicleId, slot.startActivity());
+					}
 					return null;
 				}
 			}
@@ -783,6 +819,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			if (effectivePlugActivity != null) {
 				skipChargingAtPlug(agent, effectivePlugActivity, now);
 			}
+			if (isDynamicFutureSelection() && vehicleId != null) {
+				preferredSlotByVehicle.remove(vehicleId);
+				reselectFutureActivityAfter(agent, plan, vehicleId, slot.startActivity());
+			}
 			return null;
 		}
 
@@ -791,7 +831,8 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		recordChargingDecision(personId, vehicleId, groupType, homeCharger, linkId, now, locationType,
 				decision.getChargerType(), decision.getProbability(), true, Outcome.SUCCESS, null);
 		recordBehaviourOutcome(groupType, plan.getPerson().getId(), true, decision.isMandatory());
-		if (vehicleId != null) {
+		if (vehicleId != null && (futureChargingBehaviourModel == null
+				|| futureChargingBehaviourModel.isLimitChargingToOncePerDay())) {
 			chargedVehiclesToday.add(vehicleId);
 			preferredSlotByVehicle.remove(vehicleId);
 		}
@@ -1134,6 +1175,30 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		return futureChargingBehaviourModel != null && futureChargingBehaviourModel.isLatentPublicDemandEnabled();
 	}
 
+	private void ensureFutureHomeSlots(Plan plan, List<ChargingSlot> slots, boolean hasHomeCharger) {
+		if (!hasHomeCharger) {
+			return;
+		}
+		Set<Activity> existingStarts = Collections.newSetFromMap(new IdentityHashMap<>());
+		for (ChargingSlot slot : slots) {
+			if (slot != null && !slot.isLegBased() && slot.startActivity() != null) {
+				existingStarts.add(slot.startActivity());
+			}
+		}
+		for (Activity activity : findActivityBasedChargingCandidateStarts(plan)) {
+			if (plan.getPlanElements().indexOf(activity) == 0
+					|| existingStarts.contains(activity)
+					|| FutureChargingActivityLabel.fromActivityType(activity.getType()) != FutureChargingActivityLabel.HOME) {
+				continue;
+			}
+			Charger charger = findHomeChargerForPerson(plan.getPerson().getId(), activity);
+			if (charger != null) {
+				slots.add(new ChargingSlot(activity, activity, charger));
+				existingStarts.add(activity);
+			}
+		}
+	}
+
 	/**
 	 * Paper 3 selection path: select one preferred activity across real HOME and
 	 * latent non-home opportunities before supply type is decided. This keeps HOME
@@ -1142,10 +1207,17 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 	 */
 	private void selectPreferredFutureActivity(Plan plan, List<ChargingSlot> slots, ElectricVehicle vehicle,
 			Id<Vehicle> vehicleId, GroupType groupType, boolean hasHomeCharger) {
+		selectPreferredFutureActivity(plan, slots, vehicle, vehicleId, groupType, hasHomeCharger, null);
+	}
+
+	private void selectPreferredFutureActivity(Plan plan, List<ChargingSlot> slots, ElectricVehicle vehicle,
+			Id<Vehicle> vehicleId, GroupType groupType, boolean hasHomeCharger, Activity afterActivity) {
 		if (futureChargingBehaviourModel == null || vehicle == null || vehicle.getBattery() == null
 				|| vehicleId == null) {
 			return;
 		}
+		preferredSlotByVehicle.remove(vehicleId);
+		preferredLatentPublicActivityByVehicle.remove(vehicleId);
 		double capacity = vehicle.getBattery().getCapacity();
 		if (capacity <= 0.0) {
 			return;
@@ -1162,24 +1234,31 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		}
 
 		double initialSoc = Math.max(0.0, Math.min(1.0, vehicle.getBattery().getCharge() / capacity));
-		Map<Activity, Double> socEstimates = estimateSocAtActivities(plan, vehicle);
+		Map<Activity, Double> socEstimates = estimateSocAtActivities(plan, vehicle, afterActivity);
 		Map<Activity, Double> activityDurations = estimateActivityDurations(plan);
-		Set<Activity> activityBasedChargingCandidateStarts = hasHomeCharger
-				? findActivityBasedChargingCandidateStarts(plan)
-				: Collections.emptySet();
+		Set<Activity> activityBasedChargingCandidateStarts = Collections.newSetFromMap(new IdentityHashMap<>());
+		activityBasedChargingCandidateStarts.addAll(homeSlots.keySet());
+		if (hasHomeCharger && afterActivity == null) {
+			activityBasedChargingCandidateStarts.addAll(findActivityBasedChargingCandidateStarts(plan));
+		}
 		Agent behaviourAgent = new Agent(groupType, hasHomeCharger, plan.getPerson().getId());
 
 		List<FutureActivityCandidate> optionalCandidates = new ArrayList<>();
 		Activity bestActivity = null;
 		ChargingSlot bestHomeSlot = null;
-		double bestProbability = Double.NEGATIVE_INFINITY;
+		double bestUtility = Double.NEGATIVE_INFINITY;
 		Activity firstMandatoryActivity = null;
 		ChargingSlot firstMandatoryHomeSlot = null;
 		boolean hasNonHomeCandidate = false;
 		boolean hasEligibleNonHome = false;
 
-		for (PlanElement element : plan.getPlanElements()) {
+		int afterIndex = afterActivity == null ? -1 : plan.getPlanElements().indexOf(afterActivity);
+		for (int elementIndex = 0; elementIndex < plan.getPlanElements().size(); elementIndex++) {
+			PlanElement element = plan.getPlanElements().get(elementIndex);
 			if (!(element instanceof Activity activity)) {
+				continue;
+			}
+			if (elementIndex <= afterIndex) {
 				continue;
 			}
 			String type = activity.getType();
@@ -1249,11 +1328,14 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			if (!mandatory) {
 				double utility = futureChargingBehaviourModel.computeChargingUtility(behaviourAgent, futureActivity);
 				optionalCandidates.add(new FutureActivityCandidate(activity, homeSlot, probability, utility));
-			}
-			if (probability > bestProbability) {
-				bestProbability = probability;
-				bestActivity = activity;
-				bestHomeSlot = homeSlot;
+				// Compare unbounded utilities here. Probabilities are deliberately clipped
+				// for numerical safety, so highly attractive activities can otherwise tie
+				// at the upper bound and incorrectly select the earliest one.
+				if (utility > bestUtility) {
+					bestUtility = utility;
+					bestActivity = activity;
+					bestHomeSlot = homeSlot;
+				}
 			}
 		}
 
@@ -1282,6 +1364,26 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			preferredLatentPublicActivityByVehicle.put(vehicleId, selectedActivity);
 			futureChargingBehaviourModel.recordLatentDemandPreferredSelected(groupType, personId);
 		}
+	}
+
+	private boolean isDynamicFutureSelection() {
+		return usesUnifiedFutureActivitySelection()
+				&& !futureChargingBehaviourModel.isLimitChargingToOncePerDay();
+	}
+
+	private void reselectFutureActivityAfter(MobsimAgent agent, Plan plan, Id<Vehicle> vehicleId,
+			Activity completedActivity) {
+		if (!isDynamicFutureSelection() || agent == null || plan == null || vehicleId == null
+				|| completedActivity == null) {
+			return;
+		}
+		ElectricVehicle vehicle = electricFleet.getElectricVehicles().get(vehicleId);
+		if (vehicle == null || vehicle.getBattery() == null) {
+			return;
+		}
+		List<ChargingSlot> homeSlots = futureHomeSlotsByVehicle.getOrDefault(vehicleId, List.of());
+		selectPreferredFutureActivity(plan, homeSlots, vehicle, vehicleId, determineGroupType(plan.getPerson()),
+				hasHomeCharger(plan.getPerson()), completedActivity);
 	}
 
 	private FutureActivityCandidate sampleFutureActivityCandidate(List<FutureActivityCandidate> candidates,
@@ -1337,10 +1439,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 	}
 
 	/**
-	 * Records a latent public charging demand entry for the vehicle when its preferred
-	 * latent activity actually starts. In restricted mode, the entry is skipped if the
-	 * vehicle has already charged today; in unrestricted mode the entry is always
-	 * evaluated as long as the activity matches the preferred one.
+	 * Records a latent public charging demand entry only when the vehicle reaches its
+	 * currently preferred activity. Once-per-day mode stops after that decision;
+	 * dynamic mode selects again after a rejection or after charging has updated SOC.
 	 */
 	private void evaluateLatentPublicDemand(ActivityStartEvent event, double now) {
 		if (futureChargingBehaviourModel == null
@@ -1364,10 +1465,11 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		if (vehicleId == null) {
 			return;
 		}
-		if (latentPublicDemandRecordedToday.contains(vehicleId)) {
+		boolean limitOncePerDay = futureChargingBehaviourModel.isLimitChargingToOncePerDay();
+		if (limitOncePerDay && latentPublicDemandRecordedToday.contains(vehicleId)) {
 			return;
 		}
-		if (!futureChargingBehaviourModel.isUnrestrictedLatentPublicDemand()
+		if (limitOncePerDay && !futureChargingBehaviourModel.isUnrestrictedLatentPublicDemand()
 				&& chargedVehiclesToday.contains(vehicleId)) {
 			return;
 		}
@@ -1401,6 +1503,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		boolean mandatory = futureChargingBehaviourModel.isMandatoryCharging(probeActivity);
 		feasible = createLatentFeasibleSupplyTypes(plan, currentActivity, label, homeCharger, mandatory, now, soc);
 		if (feasible.isEmpty()) {
+			if (!limitOncePerDay) {
+				preferredLatentPublicActivityByVehicle.remove(vehicleId);
+				reselectFutureActivityAfter(agent, plan, vehicleId, currentActivity);
+			}
 			return;
 		}
 		futureChargingBehaviourModel.recordLatentDemandDecisionEvaluated(groupType, personId);
@@ -1411,6 +1517,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			probability = futureChargingBehaviourModel.adjustLatentFastStartProbability(probability, futureActivity,
 					mandatory);
 			if (!mandatory && MatsimRandom.getLocalInstance().nextDouble() >= probability) {
+				if (!limitOncePerDay) {
+					preferredLatentPublicActivityByVehicle.remove(vehicleId);
+					reselectFutureActivityAfter(agent, plan, vehicleId, currentActivity);
+				}
 				return;
 			}
 			futureChargingBehaviourModel.recordLatentDemandGenerated(groupType, personId, mandatory);
@@ -1422,6 +1532,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		var decision = futureChargingBehaviourModel.makeLatentPublicDemandDecision(behaviourAgent, futureActivity,
 				MatsimRandom.getLocalInstance());
 		if (!decision.willCharge() || !futureChargingBehaviourModel.isLatentDemandSupplyType(decision.getSupplyType())) {
+			if (!limitOncePerDay) {
+				preferredLatentPublicActivityByVehicle.remove(vehicleId);
+				reselectFutureActivityAfter(agent, plan, vehicleId, currentActivity);
+			}
 			return;
 		}
 		futureChargingBehaviourModel.recordLatentDemandGenerated(groupType, personId, decision.isMandatory());
@@ -1450,8 +1564,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 						mandatory,
 						supplyType,
 						opportunityValue));
-		chargedVehiclesToday.add(vehicleId);
-		latentPublicDemandRecordedToday.add(vehicleId);
+		if (futureChargingBehaviourModel.isLimitChargingToOncePerDay()) {
+			chargedVehiclesToday.add(vehicleId);
+			latentPublicDemandRecordedToday.add(vehicleId);
+		}
 	}
 
 	private void completeLatentCharging(ActivityEndEvent event) {
@@ -1466,8 +1582,34 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 	private void completeLatentCharging(PendingLatentCharging pending, double endTime) {
 		ElectricVehicle vehicle = electricFleet.getElectricVehicles().get(pending.vehicleId());
+		double chargeBefore = vehicle != null && vehicle.getBattery() != null
+				? vehicle.getBattery().getCharge()
+				: Double.NaN;
+		boolean realizeCharging = futureChargingBehaviourModel.isRealizePublicCharging();
 		LatentChargingUpdate chargingUpdate = calculateLatentCharging(vehicle, endTime - pending.startTime(),
-				pending.supplyType(), pending.mandatory());
+				pending.supplyType(), realizeCharging || pending.mandatory());
+
+		if (realizeCharging && chargingUpdate.socUpdated()) {
+			Id<Link> linkId = pending.linkId() == null ? null : Id.createLinkId(pending.linkId());
+			double effectiveChargingEndTime = Math.min(endTime,
+					pending.startTime() + chargingUpdate.duration());
+			double eventTime = internalInterface == null ? endTime
+					: Math.max(endTime, internalInterface.getMobsim().getSimTimer().getTimeOfDay());
+			eventsManager.processEvent(new RealizedPublicChargingEvent(
+					eventTime,
+					pending.personId(),
+					pending.vehicleId(),
+					linkId,
+					pending.supplyType(),
+					pending.startTime(),
+					effectiveChargingEndTime,
+					chargingUpdate.duration(),
+					chargingUpdate.energy(),
+					chargeBefore,
+					vehicle.getBattery().getCharge(),
+					pending.soc(),
+					chargingUpdate.socAfter()));
+		}
 
 		futureChargingBehaviourModel.recordLatentPublicDemand(
 				new FutureChargingBehaviourModel.LatentPublicDemandRecord(
@@ -1494,6 +1636,12 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		futureChargingBehaviourModel.recordChargingOutcome(pending.group(), pending.personId(), true, pending.mandatory());
 		if (chargingUpdate.socUpdated()) {
 			futureChargingBehaviourModel.recordLatentDemandSocUpdated(pending.group(), pending.personId());
+		}
+		if (isDynamicFutureSelection()) {
+			Activity completedActivity = preferredLatentPublicActivityByVehicle.remove(pending.vehicleId());
+			MobsimAgent agent = qsim.getAgents().get(pending.personId());
+			Plan plan = agent == null ? null : WithinDayAgentUtils.getModifiablePlan(agent);
+			reselectFutureActivityAfter(agent, plan, pending.vehicleId(), completedActivity);
 		}
 	}
 
@@ -1729,7 +1877,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		return 0.0;
 	}
 
-	private Map<Activity, Double> estimateSocAtActivities(Plan plan, ElectricVehicle vehicle) {
+	private Map<Activity, Double> estimateSocAtActivities(Plan plan, ElectricVehicle vehicle, Activity afterActivity) {
 		if (vehicle == null || vehicle.getBattery() == null) {
 			return Collections.emptyMap();
 		}
@@ -1741,11 +1889,25 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 		Map<Activity, Double> socByActivity = new IdentityHashMap<>();
 		double charge = vehicle.getBattery().getCharge();
+		int startIndex = 0;
 		double currentTime = 0.0;
+		if (afterActivity != null) {
+			int afterIndex = plan.getPlanElements().indexOf(afterActivity);
+			if (afterIndex < 0) {
+				return Collections.emptyMap();
+			}
+			startIndex = afterIndex + 1;
+			if (afterActivity.getEndTime().isDefined()) {
+				currentTime = afterActivity.getEndTime().seconds();
+			} else if (afterActivity.getStartTime().isDefined()) {
+				currentTime = afterActivity.getStartTime().seconds();
+			}
+		}
 		DriveEnergyConsumption driveConsumption = vehicle.getDriveEnergyConsumption();
 		AuxEnergyConsumption auxConsumption = vehicle.getAuxEnergyConsumption();
 
-		for (PlanElement element : plan.getPlanElements()) {
+		for (int index = startIndex; index < plan.getPlanElements().size(); index++) {
+			PlanElement element = plan.getPlanElements().get(index);
 			if (element instanceof Activity activity) {
 				socByActivity.put(activity, Math.max(0.0, Math.min(1.0, charge / capacity)));
 				OptionalTime endTime = activity.getEndTime();
@@ -2546,6 +2708,13 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 					.processEvent(new FinishChargingAttemptEvent(now, process.agent.getId(), process.vehicle.getId()));
 			eventsManager
 					.processEvent(new FinishChargingProcessEvent(now, process.agent.getId(), process.vehicle.getId()));
+
+			if (isDynamicFutureSelection()) {
+				Activity completedActivity = process.currentSlot == null ? null : process.currentSlot.endActivity();
+				preferredSlotByVehicle.remove(process.vehicle.getId());
+				Plan plan = WithinDayAgentUtils.getModifiablePlan(process.agent);
+				reselectFutureActivityAfter(process.agent, plan, process.vehicle.getId(), completedActivity);
+			}
 
 			iterator.remove();
 		}

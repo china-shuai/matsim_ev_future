@@ -34,6 +34,8 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	private boolean publicFastFallback = true;
 	private boolean latentPublicDemand = false;
 	private boolean unrestrictedLatentPublicDemand = false;
+	private boolean realizePublicCharging = false;
+	private boolean limitChargingToOncePerDay = true;
 	private double latentWorkplaceServiceRate = 0.0;
 	private double latentDestinationServiceRate = 0.0;
 	private double minimumLatentActivityChargingDuration = 1800.0;
@@ -232,6 +234,26 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	@StringSetter("unrestrictedLatentPublicDemand")
 	public void setUnrestrictedLatentPublicDemand(boolean unrestrictedLatentPublicDemand) {
 		this.unrestrictedLatentPublicDemand = unrestrictedLatentPublicDemand;
+	}
+
+	@StringGetter("realizePublicCharging")
+	public boolean isRealizePublicCharging() {
+		return realizePublicCharging;
+	}
+
+	@StringSetter("realizePublicCharging")
+	public void setRealizePublicCharging(boolean realizePublicCharging) {
+		this.realizePublicCharging = realizePublicCharging;
+	}
+
+	@StringGetter("limitChargingToOncePerDay")
+	public boolean isLimitChargingToOncePerDay() {
+		return limitChargingToOncePerDay;
+	}
+
+	@StringSetter("limitChargingToOncePerDay")
+	public void setLimitChargingToOncePerDay(boolean limitChargingToOncePerDay) {
+		this.limitChargingToOncePerDay = limitChargingToOncePerDay;
 	}
 
 	@StringGetter("latentWorkplaceServiceRate")
