@@ -1268,6 +1268,8 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 			FutureChargingActivityLabel label = FutureChargingActivityLabel.fromActivityType(type);
 			double estimatedSoc = socEstimates.getOrDefault(activity, initialSoc);
+			boolean canFinishNextTrip = canFinishNextChargingModeTrip(plan, activity, vehicle, estimatedSoc,
+					estimateActivityTime(activity));
 			EnumSet<FutureChargingSupplyType> feasible;
 			ChargingSlot homeSlot = null;
 
@@ -1293,7 +1295,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 					feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, false, false,
 							estimatedSoc, activityDuration);
 					FutureChargingActivity probe = new FutureChargingActivity(label,
-							determineTimeBand(estimateActivityTime(activity)), estimatedSoc, null, feasible);
+							determineTimeBand(estimateActivityTime(activity)), estimatedSoc, canFinishNextTrip, feasible);
 					boolean mandatory = futureChargingBehaviourModel.isMandatoryCharging(probe);
 					feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, false, mandatory,
 							estimatedSoc, activityDuration);
@@ -1307,7 +1309,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, hasHomeCharger, false,
 						estimatedSoc, activityDuration);
 				FutureChargingActivity probe = new FutureChargingActivity(label,
-						determineTimeBand(estimateActivityTime(activity)), estimatedSoc, null, feasible);
+						determineTimeBand(estimateActivityTime(activity)), estimatedSoc, canFinishNextTrip, feasible);
 				boolean mandatory = futureChargingBehaviourModel.isMandatoryCharging(probe);
 				feasible = createLatentFeasibleSupplyTypesForDuration(plan, activity, label, hasHomeCharger, mandatory,
 						estimatedSoc, activityDuration);
@@ -1318,7 +1320,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			}
 
 			FutureChargingActivity futureActivity = new FutureChargingActivity(label,
-					determineTimeBand(estimateActivityTime(activity)), estimatedSoc, null, feasible);
+					determineTimeBand(estimateActivityTime(activity)), estimatedSoc, canFinishNextTrip, feasible);
 			boolean mandatory = futureChargingBehaviourModel.isMandatoryCharging(futureActivity);
 			double probability = futureChargingBehaviourModel.computeChargingProbability(behaviourAgent, futureActivity);
 			if (mandatory && firstMandatoryActivity == null) {
@@ -1498,7 +1500,8 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		TimeBand band = determineTimeBand(now);
 		EnumSet<FutureChargingSupplyType> feasible = createLatentFeasibleSupplyTypes(plan, currentActivity, label,
 				homeCharger, false, now, soc);
-		FutureChargingActivity probeActivity = new FutureChargingActivity(label, band, soc, null, feasible);
+		boolean canFinishNextTrip = canFinishNextChargingModeTrip(plan, currentActivity, vehicle, soc, now);
+		FutureChargingActivity probeActivity = new FutureChargingActivity(label, band, soc, canFinishNextTrip, feasible);
 		Agent behaviourAgent = new Agent(groupType, homeCharger, personId);
 		boolean mandatory = futureChargingBehaviourModel.isMandatoryCharging(probeActivity);
 		feasible = createLatentFeasibleSupplyTypes(plan, currentActivity, label, homeCharger, mandatory, now, soc);
@@ -1510,7 +1513,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			return;
 		}
 		futureChargingBehaviourModel.recordLatentDemandDecisionEvaluated(groupType, personId);
-		FutureChargingActivity futureActivity = new FutureChargingActivity(label, band, soc, null, feasible);
+		FutureChargingActivity futureActivity = new FutureChargingActivity(label, band, soc, canFinishNextTrip, feasible);
 		if (label == FutureChargingActivityLabel.HOME && !homeCharger) {
 			double probability = mandatory ? 1.0
 					: futureChargingBehaviourModel.computeChargingProbability(behaviourAgent, futureActivity);
@@ -1549,6 +1552,10 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			double soc, double probability, boolean mandatory, FutureChargingSupplyType supplyType,
 			double opportunityValue) {
 		Id<Link> linkId = event.getLinkId();
+		MobsimAgent agent = qsim.getAgents().get(personId);
+		Plan plan = agent == null ? null : WithinDayAgentUtils.getModifiablePlan(agent);
+		PlanElement currentElement = agent == null ? null : WithinDayAgentUtils.getCurrentPlanElement(agent);
+		Activity activity = currentElement instanceof Activity currentActivity ? currentActivity : null;
 		pendingLatentChargingByPerson.put(personId,
 				new PendingLatentCharging(
 						personId,
@@ -1563,7 +1570,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 						probability,
 						mandatory,
 						supplyType,
-						opportunityValue));
+						opportunityValue,
+						plan,
+						activity));
 		if (futureChargingBehaviourModel.isLimitChargingToOncePerDay()) {
 			chargedVehiclesToday.add(vehicleId);
 			latentPublicDemandRecordedToday.add(vehicleId);
@@ -1586,8 +1595,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				? vehicle.getBattery().getCharge()
 				: Double.NaN;
 		boolean realizeCharging = futureChargingBehaviourModel.isRealizePublicCharging();
+		double targetSoc = determineLatentChargingTargetSoc(pending, vehicle, endTime);
 		LatentChargingUpdate chargingUpdate = calculateLatentCharging(vehicle, endTime - pending.startTime(),
-				pending.supplyType(), realizeCharging || pending.mandatory());
+				pending.supplyType(), targetSoc, realizeCharging || pending.mandatory());
 
 		if (realizeCharging && chargingUpdate.socUpdated()) {
 			Id<Link> linkId = pending.linkId() == null ? null : Id.createLinkId(pending.linkId());
@@ -1632,6 +1642,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 						chargingUpdate.energyDemand(),
 						chargingUpdate.duration(),
 						chargingUpdate.energy(),
+						chargingUpdate.targetSoc(),
 						chargingUpdate.socAfter()));
 		futureChargingBehaviourModel.recordChargingOutcome(pending.group(), pending.personId(), true, pending.mandatory());
 		if (chargingUpdate.socUpdated()) {
@@ -1657,35 +1668,87 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 	private record PendingLatentCharging(Id<Person> personId, Id<Vehicle> vehicleId, GroupType group,
 			FutureChargingActivityLabel activityLabel, String activityType, String linkId, double startTime,
 			TimeBand timeBand, double soc, double probability, boolean mandatory, FutureChargingSupplyType supplyType,
-			double opportunityValue) {
+			double opportunityValue, Plan plan, Activity activity) {
 	}
 
 	private record LatentChargingUpdate(double demandDuration, double energyDemand, double duration, double energy,
-			double socAfter, boolean socUpdated) {
+			double targetSoc, double socAfter, boolean socUpdated) {
 	}
 
 	private LatentChargingUpdate calculateLatentCharging(ElectricVehicle vehicle, double duration,
-			FutureChargingSupplyType supplyType, boolean updateSoc) {
+			FutureChargingSupplyType supplyType, double targetSoc, boolean updateSoc) {
 		if (vehicle == null || vehicle.getBattery() == null) {
-			return new LatentChargingUpdate(0.0, 0.0, 0.0, 0.0, Double.NaN, false);
+			return new LatentChargingUpdate(0.0, 0.0, 0.0, 0.0, Double.NaN, Double.NaN, false);
 		}
 		double capacity = vehicle.getBattery().getCapacity();
 		if (capacity <= 0.0) {
-			return new LatentChargingUpdate(0.0, 0.0, 0.0, 0.0, Double.NaN, false);
+			return new LatentChargingUpdate(0.0, 0.0, 0.0, 0.0, Double.NaN, Double.NaN, false);
 		}
 		double currentCharge = vehicle.getBattery().getCharge();
+		double boundedTargetSoc = Math.max(0.0, Math.min(1.0, targetSoc));
 		double availableDuration = Math.max(0.0, duration);
 		double chargingPower = Math.max(0.0, getLatentChargingPower(supplyType));
 		double potentialEnergy = chargingPower * availableDuration;
-		double energyDemand = Math.max(0.0, Math.min(potentialEnergy, capacity - currentCharge));
+		double targetCharge = boundedTargetSoc * capacity;
+		double energyDemand = Math.max(0.0, Math.min(potentialEnergy, targetCharge - currentCharge));
 		double demandDuration = chargingPower > 0.0 ? energyDemand / chargingPower : 0.0;
 		double chargedEnergy = updateSoc ? energyDemand : 0.0;
 		double chargingDuration = updateSoc ? demandDuration : 0.0;
 		if (updateSoc && chargedEnergy > 0.0) {
 			vehicle.getBattery().setCharge(Math.min(capacity, currentCharge + chargedEnergy));
 		}
-		return new LatentChargingUpdate(demandDuration, energyDemand, chargingDuration, chargedEnergy,
+		return new LatentChargingUpdate(demandDuration, energyDemand, chargingDuration, chargedEnergy, boundedTargetSoc,
 				vehicle.getBattery().getCharge() / capacity, updateSoc && chargedEnergy > 0.0);
+	}
+
+	private double determineLatentChargingTargetSoc(PendingLatentCharging pending, ElectricVehicle vehicle,
+			double chargingEndTime) {
+		if (pending.supplyType() != FutureChargingSupplyType.FAST) {
+			return 1.0;
+		}
+		double targetSoc = futureChargingBehaviourModel.getLatentPublicFastTargetSoc();
+		if (!pending.mandatory() || vehicle == null || vehicle.getBattery() == null) {
+			return targetSoc;
+		}
+
+		// A mandatory PFC may go past the ordinary 80% target only when the next EV
+		// trip, plus the configured minimum-SOC reserve, requires it.
+		double requiredSoc = estimateNextChargingModeLegSoc(pending.plan(), pending.activity(), vehicle, chargingEndTime);
+		return Math.min(1.0, Math.max(targetSoc, requiredSoc + futureChargingBehaviourModel.getMinimumSoc()));
+	}
+
+	private double estimateNextChargingModeLegSoc(Plan plan, Activity activity, ElectricVehicle vehicle,
+			double departureTime) {
+		if (plan == null || activity == null || vehicle == null || vehicle.getBattery() == null
+				|| vehicle.getBattery().getCapacity() <= 0.0) {
+			return 0.0;
+		}
+		int activityIndex = plan.getPlanElements().indexOf(activity);
+		if (activityIndex < 0) {
+			return 0.0;
+		}
+		DriveEnergyConsumption driveConsumption = vehicle.getDriveEnergyConsumption();
+		AuxEnergyConsumption auxConsumption = vehicle.getAuxEnergyConsumption();
+		for (int index = activityIndex + 1; index < plan.getPlanElements().size(); index++) {
+			PlanElement element = plan.getPlanElements().get(index);
+			if (!(element instanceof Leg leg) || !chargingMode.equals(leg.getMode())) {
+				continue;
+			}
+			double legDepartureTime = leg.getDepartureTime().isDefined() ? leg.getDepartureTime().seconds() : departureTime;
+			double travelTime = leg.getTravelTime().isDefined() ? leg.getTravelTime().seconds() : Double.NaN;
+			if (Double.isNaN(travelTime) && leg.getRoute() != null && leg.getRoute().getTravelTime().isDefined()) {
+				travelTime = leg.getRoute().getTravelTime().seconds();
+			}
+			double energy = estimateLegEnergy(leg, driveConsumption, auxConsumption, legDepartureTime, travelTime);
+			return Math.max(0.0, Math.min(1.0, energy / vehicle.getBattery().getCapacity()));
+		}
+		return 0.0;
+	}
+
+	private boolean canFinishNextChargingModeTrip(Plan plan, Activity activity, ElectricVehicle vehicle,
+			double availableSoc, double departureTime) {
+		double requiredSoc = estimateNextChargingModeLegSoc(plan, activity, vehicle, departureTime);
+		return availableSoc + 1e-9 >= requiredSoc + futureChargingBehaviourModel.getMinimumSoc();
 	}
 
 	private double getLatentChargingPower(FutureChargingSupplyType supplyType) {

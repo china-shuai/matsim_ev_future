@@ -255,6 +255,21 @@ public class FutureChargingActivitySelectionTest {
 	}
 
 	@Test
+	public void testConditionalPublicFastChargingStopsAtConfiguredTargetSoc() {
+		TestRun run = runFutureScenario(false, 0.4, 0.0, MiddayHomeSlotProvider.class,
+				"car", "car", "car", true, true, 0.8);
+
+		var records = run.model().consumeLatentPublicDemandRecords();
+		assertEquals(1, records.size());
+		var record = records.getFirst();
+		assertFalse(record.mandatory());
+		assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
+		assertEquals(0.8, record.targetSoc(), 1e-9);
+		assertEquals(0.8, record.socAfterCharging(), 1e-9,
+				"A sufficiently long conditional PFC stop must stop at the configured 80% target.");
+	}
+
+	@Test
 	public void testDynamicSelectionSkipsIntermediateActivityAndReselectsAfterSocUpdate() {
 		TestScenario scenario = new TestScenarioBuilder(utils)
 				.setElectricVehicleRange(100_000.0)
@@ -357,6 +372,14 @@ public class FutureChargingActivitySelectionTest {
 	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
 			Class<? extends ChargingSlotProvider> slotProviderClass, String firstWorkMode, String homeMode,
 			String secondWorkMode, boolean realizePublicCharging, boolean limitChargingToOncePerDay) {
+		return runFutureScenario(preferHome, initialSoc, minimumSoc, slotProviderClass, firstWorkMode, homeMode,
+				secondWorkMode, realizePublicCharging, limitChargingToOncePerDay, 1.0);
+	}
+
+	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
+			Class<? extends ChargingSlotProvider> slotProviderClass, String firstWorkMode, String homeMode,
+			String secondWorkMode, boolean realizePublicCharging, boolean limitChargingToOncePerDay,
+			double latentPublicFastTargetSoc) {
 		TestScenario scenario = new TestScenarioBuilder(utils)
 				.setElectricVehicleRange(100_000.0)
 				.addHomeCharger("person", 0, 0, 1, 1.0, "default")
@@ -377,6 +400,7 @@ public class FutureChargingActivitySelectionTest {
 		cfg.setMinimumSoc(minimumSoc);
 		cfg.setMinimumLatentFastChargingDuration(0.0);
 		cfg.setMaximumLatentPublicFastSoc(1.0);
+		cfg.setLatentPublicFastTargetSoc(latentPublicFastTargetSoc);
 		cfg.setRealizePublicCharging(realizePublicCharging);
 		cfg.setLimitChargingToOncePerDay(limitChargingToOncePerDay);
 
