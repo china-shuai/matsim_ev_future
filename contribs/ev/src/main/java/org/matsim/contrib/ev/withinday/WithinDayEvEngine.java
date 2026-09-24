@@ -54,6 +54,7 @@ import org.matsim.contrib.ev.fleet.ElectricVehicle;
 import org.matsim.contrib.ev.infrastructure.Charger;
 import org.matsim.contrib.ev.infrastructure.ChargingInfrastructure;
 import org.matsim.contrib.ev.strategic.infrastructure.PersonChargerProvider;
+import org.matsim.contrib.ev.strategic.infrastructure.PublicChargerProvider;
 import org.matsim.contrib.ev.discharging.AuxEnergyConsumption;
 import org.matsim.contrib.ev.discharging.DriveEnergyConsumption;
 import org.matsim.contrib.ev.withinday.events.AbortChargingAttemptEvent;
@@ -866,7 +867,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			if (!hasHomeCharger) {
 				// 没有家充授权，改为寻找公共快充
 				double targetPower = getDcfcReferencePower();
-				if (matchesPreference(current, targetPower, true)) {
+				if (isPublicPreferenceCharger(current) && matchesPreference(current, targetPower, true)) {
 					return new AdaptationResult(slot, plugActivity, true, false);
 				}
 
@@ -936,7 +937,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 		double targetPower = preferHigherPower ? getDcfcReferencePower() : getAcReferencePower();
 
-		if (matchesPreference(current, targetPower, preferHigherPower)) {
+		if (isPublicPreferenceCharger(current) && matchesPreference(current, targetPower, preferHigherPower)) {
 			return new AdaptationResult(slot, plugActivity, true, false);
 		}
 
@@ -1007,7 +1008,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		Charger best = null;
 
 		for (Charger candidate : chargingInfrastructure.getChargers().values()) {
-			if (candidate == null || candidate.equals(current)) {
+			if (!isPublicPreferenceCharger(candidate) || candidate.equals(current)) {
 				continue;
 			}
 			if (!matchesPreference(candidate, targetPower, preferHigherPower)) {
@@ -1046,7 +1047,25 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 		}
 	}
 
-	private boolean isChargerOwnedByPerson(Charger charger, Id<Person> personId) {
+	// Destination AC/DCFC substitution must never bypass the public-provider boundary.
+	static boolean isPublicPreferenceCharger(Charger charger) {
+		return charger != null
+				&& PublicChargerProvider.isPublicCharger(charger.getSpecification())
+				&& !PersonChargerProvider.isPersonCharger(charger.getSpecification())
+				&& !charger.getId().toString().startsWith("privateCharger_");
+	}
+
+	// Final invariant for all entry paths, including retries, en-route and overnight slots.
+	static void requirePrivateChargerOwnership(Charger charger, Id<Person> personId) {
+		boolean isPrivate = PersonChargerProvider.isPersonCharger(charger.getSpecification())
+				|| charger.getId().toString().startsWith("privateCharger_");
+		if (isPrivate && !isChargerOwnedByPerson(charger, personId)) {
+			throw new IllegalStateException("PRIVATE_CHARGER_ACCESS_VIOLATION person=" + personId
+					+ " charger=" + charger.getId());
+		}
+	}
+
+	private static boolean isChargerOwnedByPerson(Charger charger, Id<Person> personId) {
 		if (charger == null || personId == null) {
 			return false;
 		}
@@ -2542,6 +2561,7 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 					personMaximumQueueWaitTime = maximumQueueWaitTime;
 				}
 
+				requirePrivateChargerOwnership(process.currentSlot.charger(), process.agent.getId());
 				// add vehicle to charger, it will be either queued or plugged
 				ChargingStrategy chargingStrategy = chargingStrategyFactory
 						.createStrategy(process.currentSlot.charger().getSpecification(), process.vehicle);
