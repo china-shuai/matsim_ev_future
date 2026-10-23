@@ -1665,7 +1665,12 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 						chargingUpdate.energy(),
 						chargingUpdate.targetSoc(),
 						chargingUpdate.socAfter()));
-		futureChargingBehaviourModel.recordChargingOutcome(pending.group(), pending.personId(), true, pending.mandatory());
+		// Count the event as a charge for eta calibration only if it delivers energy. A latent charge that
+		// starts at or above its target SoC (e.g. FAST at SoC >= latentPublicFastTargetSoc) has zero energy
+		// and must not inflate the simulated charging frequency.
+		boolean deliveredEnergy = chargingUpdate.energyDemand() > 0.0;
+		futureChargingBehaviourModel.recordChargingOutcome(pending.group(), pending.personId(), deliveredEnergy,
+				pending.mandatory());
 		if (chargingUpdate.socUpdated()) {
 			futureChargingBehaviourModel.recordLatentDemandSocUpdated(pending.group(), pending.personId());
 		}
