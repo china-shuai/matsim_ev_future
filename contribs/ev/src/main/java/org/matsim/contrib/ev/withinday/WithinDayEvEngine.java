@@ -33,6 +33,7 @@ import org.matsim.api.core.v01.population.Leg;
 import org.matsim.api.core.v01.population.Person;
 import org.matsim.api.core.v01.population.Plan;
 import org.matsim.api.core.v01.population.PlanElement;
+import org.matsim.contrib.ev.EvConfigGroup;
 import org.matsim.contrib.ev.charging.ChargingStartEvent;
 import org.matsim.contrib.ev.charging.ChargingStartEventHandler;
 import org.matsim.contrib.ev.charging.ChargingStrategy;
@@ -50,6 +51,7 @@ import org.matsim.contrib.ev.behavior.GroupType;
 import org.matsim.contrib.ev.behavior.LocationType;
 import org.matsim.contrib.ev.behavior.TimeBand;
 import org.matsim.contrib.ev.fleet.ElectricFleet;
+import org.matsim.contrib.ev.fleet.ElectricFleetUtils;
 import org.matsim.contrib.ev.fleet.ElectricVehicle;
 import org.matsim.contrib.ev.infrastructure.Charger;
 import org.matsim.contrib.ev.infrastructure.ChargingInfrastructure;
@@ -2811,9 +2813,24 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			return;
 		}
 		double endTime = Math.max(SECONDS_PER_DAY, internalInterface.getMobsim().getSimTimer().getTimeOfDay());
+		// Public charges still pending at the end of the day (charging during the last activity) are
+		// completed here, i.e. AFTER MobsimBeforeCleanup. ElectricFleetModule takes its
+		// UpdateAfterIteration SoC snapshot in MobsimBeforeCleanup, so without the block below this
+		// energy would be realised in the battery but not carried into the next iteration.
+		EvConfigGroup evCfg = (EvConfigGroup) qsim.getScenario().getConfig().getModules()
+				.get(EvConfigGroup.GROUP_NAME);
+		boolean carrySoc = evCfg != null
+				&& evCfg.getInitialSocBehavior() == EvConfigGroup.InitialSocBehavior.UpdateAfterIteration;
 		for (PendingLatentCharging pending : List.copyOf(pendingLatentChargingByPerson.values())) {
 			if (endTime >= pending.startTime()) {
 				completeLatentCharging(pending, endTime);
+				if (carrySoc) {
+					ElectricVehicle vehicle = electricFleet.getElectricVehicles().get(pending.vehicleId());
+					if (vehicle != null && vehicle.getBattery() != null) {
+						ElectricFleetUtils.setInitialSoc(vehicle.getVehicleSpecification().getMatsimVehicle(),
+								Math.max(0.0, Math.min(1.0, vehicle.getBattery().getSoc())));
+					}
+				}
 			}
 		}
 		pendingLatentChargingByPerson.clear();
