@@ -40,11 +40,14 @@ public final class FutureChargingBehaviourModel {
 	private final boolean publicFastFallback;
 	private final boolean latentPublicDemand;
 	private final boolean unrestrictedLatentPublicDemand;
+	private final boolean realizePublicCharging;
+	private final boolean limitChargingToOncePerDay;
 	private final double latentWorkplaceServiceRate;
 	private final double latentDestinationServiceRate;
 	private final double minimumLatentActivityChargingDuration;
 	private final double minimumLatentFastChargingDuration;
 	private final double maximumLatentPublicFastSoc;
+	private final double latentPublicFastTargetSoc;
 	private final double publicStartSocWeightExponent;
 	private final double latentPublicFastSearchRadius;
 	private final String latentPublicDemandFile;
@@ -70,11 +73,14 @@ public final class FutureChargingBehaviourModel {
 		this.publicFastFallback = cfg.isPublicFastFallback();
 		this.latentPublicDemand = cfg.isLatentPublicDemand();
 		this.unrestrictedLatentPublicDemand = cfg.isUnrestrictedLatentPublicDemand();
+		this.realizePublicCharging = cfg.isRealizePublicCharging();
+		this.limitChargingToOncePerDay = cfg.isLimitChargingToOncePerDay();
 		this.latentWorkplaceServiceRate = cfg.getLatentWorkplaceServiceRate();
 		this.latentDestinationServiceRate = cfg.getLatentDestinationServiceRate();
 		this.minimumLatentActivityChargingDuration = cfg.getMinimumLatentActivityChargingDuration();
 		this.minimumLatentFastChargingDuration = cfg.getMinimumLatentFastChargingDuration();
 		this.maximumLatentPublicFastSoc = cfg.getMaximumLatentPublicFastSoc();
+		this.latentPublicFastTargetSoc = cfg.getLatentPublicFastTargetSoc();
 		this.publicStartSocWeightExponent = cfg.getPublicStartSocWeightExponent();
 		this.latentPublicFastSearchRadius = cfg.getLatentPublicFastSearchRadius();
 		this.latentPublicDemandFile = cfg.getLatentPublicDemandFile();
@@ -163,6 +169,14 @@ public final class FutureChargingBehaviourModel {
 		return unrestrictedLatentPublicDemand;
 	}
 
+	public boolean isRealizePublicCharging() {
+		return realizePublicCharging;
+	}
+
+	public boolean isLimitChargingToOncePerDay() {
+		return limitChargingToOncePerDay;
+	}
+
 	public String getLatentPublicDemandFile() {
 		return latentPublicDemandFile;
 	}
@@ -198,6 +212,14 @@ public final class FutureChargingBehaviourModel {
 
 	public double getMaximumLatentPublicFastSoc() {
 		return maximumLatentPublicFastSoc;
+	}
+
+	public double getLatentPublicFastTargetSoc() {
+		return latentPublicFastTargetSoc;
+	}
+
+	public double getMinimumSoc() {
+		return minimumSoc;
 	}
 
 	public double getPublicStartSocWeightExponent() {
@@ -801,6 +823,6 @@ public final class FutureChargingBehaviourModel {
 			FutureChargingActivityLabel activityLabel, String activityType, String linkId, double time, TimeBand timeBand,
 			double soc, double probability, boolean mandatory, FutureChargingSupplyType supplyType,
 			double opportunityValue, String demandType, boolean socUpdated, double demandDuration, double energyDemand,
-			double chargingDuration, double chargedEnergy, double socAfterCharging) {
+			double chargingDuration, double chargedEnergy, double targetSoc, double socAfterCharging) {
 	}
 }

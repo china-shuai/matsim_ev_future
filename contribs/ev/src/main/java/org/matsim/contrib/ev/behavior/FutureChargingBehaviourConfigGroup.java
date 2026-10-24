@@ -34,11 +34,14 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	private boolean publicFastFallback = true;
 	private boolean latentPublicDemand = false;
 	private boolean unrestrictedLatentPublicDemand = false;
+	private boolean realizePublicCharging = false;
+	private boolean limitChargingToOncePerDay = true;
 	private double latentWorkplaceServiceRate = 0.0;
 	private double latentDestinationServiceRate = 0.0;
 	private double minimumLatentActivityChargingDuration = 1800.0;
 	private double minimumLatentFastChargingDuration = 900.0;
 	private double maximumLatentPublicFastSoc = 1.0;
+	private double latentPublicFastTargetSoc = 1.0;
 	private double publicStartSocWeightExponent = 0.0;
 	private String latentPublicDemandFile = "futureChargingLatentPublicDemand.csv";
 	private String timePreferenceFile;
@@ -234,6 +237,26 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 		this.unrestrictedLatentPublicDemand = unrestrictedLatentPublicDemand;
 	}
 
+	@StringGetter("realizePublicCharging")
+	public boolean isRealizePublicCharging() {
+		return realizePublicCharging;
+	}
+
+	@StringSetter("realizePublicCharging")
+	public void setRealizePublicCharging(boolean realizePublicCharging) {
+		this.realizePublicCharging = realizePublicCharging;
+	}
+
+	@StringGetter("limitChargingToOncePerDay")
+	public boolean isLimitChargingToOncePerDay() {
+		return limitChargingToOncePerDay;
+	}
+
+	@StringSetter("limitChargingToOncePerDay")
+	public void setLimitChargingToOncePerDay(boolean limitChargingToOncePerDay) {
+		this.limitChargingToOncePerDay = limitChargingToOncePerDay;
+	}
+
 	@StringGetter("latentWorkplaceServiceRate")
 	public double getLatentWorkplaceServiceRate() {
 		return latentWorkplaceServiceRate;
@@ -282,6 +305,21 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	@StringSetter("maximumLatentPublicFastSoc")
 	public void setMaximumLatentPublicFastSoc(double maximumLatentPublicFastSoc) {
 		this.maximumLatentPublicFastSoc = clip01(maximumLatentPublicFastSoc);
+	}
+
+	/**
+	 * Target state of charge for conditional public fast charging. Mandatory
+	 * charging may exceed this target when the next EV trip plus the configured
+	 * minimum-SOC reserve requires it.
+	 */
+	@StringGetter("latentPublicFastTargetSoc")
+	public double getLatentPublicFastTargetSoc() {
+		return latentPublicFastTargetSoc;
+	}
+
+	@StringSetter("latentPublicFastTargetSoc")
+	public void setLatentPublicFastTargetSoc(double latentPublicFastTargetSoc) {
+		this.latentPublicFastTargetSoc = clip01(latentPublicFastTargetSoc);
 	}
 
 	@StringGetter("publicStartSocWeightExponent")
