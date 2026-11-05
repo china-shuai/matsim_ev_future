@@ -80,8 +80,14 @@ public final class DriveDischargingHandler
 	private final Map<Id<Vehicle>, ? extends ElectricVehicle> eVehicles;
 	private final Map<Id<Vehicle>, EvDrive> evDrives;
 
-	private final Queue<LinkLeaveEvent> linkLeaveEvents = new ConcurrentLinkedQueue<>();
-	private final Queue<VehicleLeavesTrafficEvent> trafficLeaveEvents = new ConcurrentLinkedQueue<>();
+	// Paper 3 fix (2026-11-05): enters-traffic, link-leave and leaves-traffic events are kept in ONE queue and are
+	// all processed in the main thread, in the order in which the handler received them. Previously the EvDrive
+	// state was created in the event-handling thread on VehicleEntersTraffic while the previous trip's
+	// VehicleLeavesTraffic was processed (and the state removed) in the main thread. For a trip starting one second
+	// after the previous trip ended (zero-duration activity in between) the main thread could remove the NEW trip's
+	// state, so the whole trip was driven without discharge. The loss depended on event-handling speed and was
+	// therefore larger on iterations without event writing (home charging +2-5% on event-writing iterations).
+	private final Queue<Event> driveEvents = new ConcurrentLinkedQueue<>();
 	private final QSim qsim;
 	@Inject
 	DriveDischargingHandler(QSim qsim, ElectricFleet data, Network network, EventsManager eventsManager) {
@@ -94,24 +100,22 @@ public final class DriveDischargingHandler
 
 	@Override
 	public void handleEvent(VehicleEntersTrafficEvent event) {
-		Id<Vehicle> vehicleId = event.getVehicleId();
-		ElectricVehicle ev = eVehicles.get(vehicleId);
-		if (ev != null) {// handle only our EVs
-			evDrives.put(vehicleId, new EvDrive(vehicleId, ev));
+		if (eVehicles.containsKey(event.getVehicleId())) {// handle only our EVs
+			driveEvents.add(event);
 		}
 	}
 
 	@Override
 	public void handleEvent(LinkLeaveEvent event) {
-		if (evDrives.containsKey(event.getVehicleId())) {// handle only our EVs
-			linkLeaveEvents.add(event);
+		if (eVehicles.containsKey(event.getVehicleId())) {// handle only our EVs
+			driveEvents.add(event);
 		}
 	}
 
 	@Override
 	public void handleEvent(VehicleLeavesTrafficEvent event) {
-		if (evDrives.containsKey(event.getVehicleId())) {// handle only our EVs
-			trafficLeaveEvents.add(event);
+		if (eVehicles.containsKey(event.getVehicleId())) {// handle only our EVs
+			driveEvents.add(event);
 		}
 	}
 
@@ -121,8 +125,8 @@ public final class DriveDischargingHandler
 
 	@Override
 	public void afterSim() {
-		// process remaining events
-		doSimStep(this.qsim.getSimTimer().getTimeOfDay());
+		// process all remaining events
+		handleQueuedEvents(Double.POSITIVE_INFINITY);
 	}
 
 	@Override
@@ -131,28 +135,34 @@ public final class DriveDischargingHandler
 
 	@Override
 	public void doSimStep(double time) {
-		handleQueuedEvents(linkLeaveEvents, time, false);
-		handleQueuedEvents(trafficLeaveEvents, time, true);
+		handleQueuedEvents(time);
 	}
 
-	private <E extends Event & HasVehicleId & HasLinkId> void handleQueuedEvents(Queue<E> queue, double time, boolean leftTraffic) {
-		// We want to process events in the main thread (instead of the event handling threads).
-		// This is to eliminate race conditions, where the battery is read/modified by many threads without proper synchronisation
-		while (!queue.isEmpty()) {
-			var event = queue.peek();
-			if (event.getTime() == time) {
-				// There is a potential race condition wrt processing events between doSimStep() and handleEvent().
-				// To ensure a deterministic behaviour, we only process events from the previous time step.
+	private void handleQueuedEvents(double time) {
+		// Events are processed in the main thread (instead of the event handling threads) to avoid races on the
+		// battery. Only events from previous time steps are processed; events of the current step may still be
+		// arriving from the event-handling threads.
+		while (!driveEvents.isEmpty()) {
+			Event event = driveEvents.peek();
+			if (event.getTime() >= time) {
 				break;
 			}
+			driveEvents.remove();
 
-			var evDrive = dischargeVehicle(event.getVehicleId(), event.getLinkId(), event.getTime(), time);
+			if (event instanceof VehicleEntersTrafficEvent enters) {
+				Id<Vehicle> vehicleId = enters.getVehicleId();
+				evDrives.put(vehicleId, new EvDrive(vehicleId, eVehicles.get(vehicleId)));
+				continue;
+			}
+
+			boolean leftTraffic = event instanceof VehicleLeavesTrafficEvent;
+			Id<Vehicle> vehicleId = ((HasVehicleId) event).getVehicleId();
+			Id<Link> linkId = ((HasLinkId) event).getLinkId();
+			var evDrive = dischargeVehicle(vehicleId, linkId, event.getTime(), Math.min(time, qsim.getSimTimer().getTimeOfDay()));
 			if (evDrive == null) {
 				if (LOG.isDebugEnabled()) {
-					LOG.debug("No EV state found for vehicle {} on link {} at time {}. Likely the vehicle entered and left traffic within the same timestep.",
-							event.getVehicleId(), event.getLinkId(), event.getTime());
+					LOG.debug("No EV state found for vehicle {} on link {} at time {}.", vehicleId, linkId, event.getTime());
 				}
-				queue.remove();
 				continue;
 			}
 			if (leftTraffic) {
@@ -160,7 +170,6 @@ public final class DriveDischargingHandler
 			} else {
 				evDrive.movedOverNodeTime = event.getTime();
 			}
-			queue.remove();
 		}
 	}
 

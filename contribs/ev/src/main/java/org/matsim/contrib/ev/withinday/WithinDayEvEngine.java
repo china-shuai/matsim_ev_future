@@ -1867,12 +1867,22 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 
 		Map<Activity, Double> durations = new IdentityHashMap<>();
 		double currentTime = 0.0;
+		Activity finalActivity = findFinalActivity(plan);
+		double overnightEnd = Double.NaN;
+		if (!plan.getPlanElements().isEmpty() && plan.getPlanElements().get(0) instanceof Activity first
+				&& first.getEndTime().isDefined() && Double.isFinite(first.getEndTime().seconds())) {
+			overnightEnd = first.getEndTime().seconds() + SECONDS_PER_DAY;
+		}
 		for (PlanElement element : plan.getPlanElements()) {
 			if (element instanceof Activity activity) {
 				double startTime = activity.getStartTime().isDefined() ? activity.getStartTime().seconds()
 						: currentTime;
 				double endTime = Double.NaN;
-				if (activity.getEndTime().isDefined()) {
+				if (activity == finalActivity && Double.isFinite(overnightEnd)) {
+					// Paper 3 fix (2026-11-05): the final activity lasts overnight until the first departure of the
+					// next day; its artificial 23:30-24:00 end time in the input plans is ignored.
+					endTime = Math.max(overnightEnd, Math.max(startTime, currentTime));
+				} else if (activity.getEndTime().isDefined()) {
 					endTime = activity.getEndTime().seconds();
 				} else if (activity.getMaximumDuration().isDefined()) {
 					endTime = startTime + activity.getMaximumDuration().seconds();
@@ -1895,6 +1905,27 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			}
 		}
 		return durations;
+	}
+
+	private Activity findFinalActivity(Plan plan) {
+		if (plan == null) {
+			return null;
+		}
+		List<PlanElement> elements = plan.getPlanElements();
+		for (int i = elements.size() - 1; i >= 0; i--) {
+			if (elements.get(i) instanceof Activity activity) {
+				String type = activity.getType();
+				if (type == null || isManagedActivityType(type) || TripStructureUtils.isStageActivityType(type)) {
+					continue;
+				}
+				return activity;
+			}
+		}
+		return null;
+	}
+
+	private boolean isFinalActivity(Plan plan, Activity activity) {
+		return activity != null && activity == findFinalActivity(plan);
 	}
 
 	private double estimateActivityDuration(Activity activity) {
@@ -2758,8 +2789,16 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				|| process.isOvernight || process.isWholeDay) {
 			return Double.NaN;
 		}
+		Plan deadlinePlan = WithinDayAgentUtils.getModifiablePlan(process.agent);
+		if (isFinalActivity(deadlinePlan, process.currentSlot.endActivity())) {
+			// Paper 3 fix (2026-11-05): the final activity of the day is open-ended (QSim ignores its end time). The
+			// input plans carry an artificial end time of 23:30-24:00 on it, which previously unplugged home charging
+			// at that time and gave zero energy to vehicles arriving later. Keep the vehicle plugged until the end of
+			// the simulation instead.
+			return Double.NaN;
+		}
 		OptionalTime endTime = timeInterpretation.decideOnActivityEndTimeAlongPlan(process.currentSlot.endActivity(),
-				WithinDayAgentUtils.getModifiablePlan(process.agent));
+				deadlinePlan);
 		return endTime.isDefined() ? endTime.seconds() : Double.NaN;
 	}
 
