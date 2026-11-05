@@ -1481,11 +1481,26 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			return;
 		}
 		PlanElement currentElement = WithinDayAgentUtils.getCurrentPlanElement(agent);
-		if (!(currentElement instanceof Activity currentActivity)) {
-			return;
-		}
 		Id<Vehicle> vehicleId = VehicleUtils.getVehicleId(plan.getPerson(), chargingMode);
 		if (vehicleId == null) {
+			return;
+		}
+		Activity eventActivity = findEventActivity(plan, agent, event);
+		if (futureChargingBehaviourModel.isMandatoryNearestPublicFast() && eventActivity != null
+				&& tryMandatoryNearestPublicFast(agent, plan, eventActivity, vehicleId, now)) {
+			return;
+		}
+		if (eventActivity != null && currentElement != eventActivity) {
+			// Paper 3 fix (2026-11-05): activity start events are processed one step later, so for a zero-duration
+			// activity the agent has already left. Previously a preferred activity skipped in this way was dropped
+			// silently and the agent had no further charging opportunity that day; now the next activity is selected.
+			if (preferredLatentPublicActivityByVehicle.get(vehicleId) == eventActivity && isDynamicFutureSelection()) {
+				preferredLatentPublicActivityByVehicle.remove(vehicleId);
+				reselectFutureActivityAfter(agent, plan, vehicleId, eventActivity);
+			}
+			return;
+		}
+		if (!(currentElement instanceof Activity currentActivity)) {
 			return;
 		}
 		boolean limitOncePerDay = futureChargingBehaviourModel.isLimitChargingToOncePerDay();
@@ -1568,6 +1583,87 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 				decision.getOpportunityValue());
 	}
 
+	/**
+	 * Finds the main plan activity that the activity start event refers to: the current plan element if it matches,
+	 * otherwise the most recent matching main activity before the current position (the agent may already have
+	 * left a zero-duration activity when the event is processed).
+	 */
+	private Activity findEventActivity(Plan plan, MobsimAgent agent, ActivityStartEvent event) {
+		List<PlanElement> elements = plan.getPlanElements();
+		int index = Math.min(WithinDayAgentUtils.getCurrentPlanElementIndex(agent), elements.size() - 1);
+		for (int i = index; i >= 0; i--) {
+			if (elements.get(i) instanceof Activity activity) {
+				String type = activity.getType();
+				if (type == null || isManagedActivityType(type) || TripStructureUtils.isStageActivityType(type)) {
+					continue;
+				}
+				return matchesActivity(event, activity) ? activity : null;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Paper 3 (2026-11-05, mandatoryNearestPublicFast): if the actual SoC at the start of an activity triggers
+	 * mandatory charging (SoC below the minimum SoC, or the next EV trip cannot be completed), the vehicle charges
+	 * immediately at the nearest public fast-charging candidate, irrespective of distance, up to the public
+	 * fast-charging target SoC (or higher if the next trip requires it). The charge is not limited by the dwell
+	 * time of the activity. Agents with a home charger at a home activity are left to home charging.
+	 */
+	private boolean tryMandatoryNearestPublicFast(MobsimAgent agent, Plan plan, Activity activity,
+			Id<Vehicle> vehicleId, double now) {
+		Id<Person> personId = plan.getPerson().getId();
+		if (pendingLatentChargingByPerson.containsKey(personId)) {
+			return false;
+		}
+		ElectricVehicle vehicle = electricFleet.getElectricVehicles().get(vehicleId);
+		if (vehicle == null || vehicle.getBattery() == null || vehicle.getBattery().getCapacity() <= 0.0) {
+			return false;
+		}
+		double capacity = vehicle.getBattery().getCapacity();
+		double soc = Math.max(0.0, Math.min(1.0, vehicle.getBattery().getCharge() / capacity));
+		Person person = plan.getPerson();
+		boolean homeCharger = hasHomeCharger(person);
+		String activityType = activity.getType();
+		FutureChargingActivityLabel label = FutureChargingActivityLabel.fromActivityType(activityType);
+		if (label == FutureChargingActivityLabel.HOME && homeCharger) {
+			return false;
+		}
+		TimeBand band = determineTimeBand(now);
+		boolean canFinishNextTrip = canFinishNextChargingModeTrip(plan, activity, vehicle, soc, now);
+		FutureChargingActivity probe = new FutureChargingActivity(label, band, soc, canFinishNextTrip,
+				EnumSet.of(FutureChargingSupplyType.FAST));
+		if (!futureChargingBehaviourModel.isMandatoryCharging(probe)) {
+			return false;
+		}
+		Id<Link> linkId = activity.getLinkId();
+		Coord site = futureChargingBehaviourModel
+				.getNearestLatentPublicFastCandidate(PopulationUtils.decideOnCoordForActivity(activity, scenario));
+		if (site != null) {
+			Link siteLink = org.matsim.core.network.NetworkUtils.getNearestLink(scenario.getNetwork(), site);
+			if (siteLink != null) {
+				linkId = siteLink.getId();
+			}
+		}
+		GroupType groupType = determineGroupType(person);
+		futureChargingBehaviourModel.recordLatentDemandDecisionEvaluated(groupType, personId);
+		futureChargingBehaviourModel.recordLatentDemandGenerated(groupType, personId, true);
+		PendingLatentCharging pending = new PendingLatentCharging(personId, vehicleId, groupType, label, activityType,
+				linkId != null ? linkId.toString() : null, now, band, soc, 1.0, true, FutureChargingSupplyType.FAST,
+				futureChargingBehaviourModel.computeOpportunityValue(groupType, probe), plan, activity);
+		double targetSoc = determineLatentChargingTargetSoc(pending, vehicle, now);
+		double power = getLatentChargingPower(FutureChargingSupplyType.FAST);
+		double neededEnergy = Math.max(0.0, targetSoc * capacity - vehicle.getBattery().getCharge());
+		double duration = power > 0.0 ? neededEnergy / power + 1.0 : 0.0;
+		// remove the preferred activity first so that completion does not reselect relative to it
+		preferredLatentPublicActivityByVehicle.remove(vehicleId);
+		completeLatentCharging(pending, now + duration);
+		if (isDynamicFutureSelection()) {
+			reselectFutureActivityAfter(agent, plan, vehicleId, activity);
+		}
+		return true;
+	}
+
 	private void recordPendingLatentCharging(ActivityStartEvent event, Id<Person> personId, Id<Vehicle> vehicleId,
 			GroupType groupType, FutureChargingActivityLabel label, String activityType, double now, TimeBand band,
 			double soc, double probability, boolean mandatory, FutureChargingSupplyType supplyType,
@@ -1624,8 +1720,9 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 			Id<Link> linkId = pending.linkId() == null ? null : Id.createLinkId(pending.linkId());
 			double effectiveChargingEndTime = Math.min(endTime,
 					pending.startTime() + chargingUpdate.duration());
+			// events must not be dated in the future (mandatory nearest-station charges are completed immediately)
 			double eventTime = internalInterface == null ? endTime
-					: Math.max(endTime, internalInterface.getMobsim().getSimTimer().getTimeOfDay());
+					: internalInterface.getMobsim().getSimTimer().getTimeOfDay();
 			eventsManager.processEvent(new RealizedPublicChargingEvent(
 					eventTime,
 					pending.personId(),

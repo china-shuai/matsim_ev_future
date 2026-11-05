@@ -38,6 +38,7 @@ public final class FutureChargingBehaviourModel {
 	private final boolean destinationChargingAvailable;
 	private final EnumSet<FutureChargingActivityLabel> destinationChargingActivityLabels;
 	private final boolean publicFastFallback;
+	private final boolean mandatoryNearestPublicFast;
 	private final boolean latentPublicDemand;
 	private final boolean unrestrictedLatentPublicDemand;
 	private final boolean realizePublicCharging;
@@ -71,6 +72,7 @@ public final class FutureChargingBehaviourModel {
 		this.destinationChargingAvailable = cfg.isDestinationChargingAvailable();
 		this.destinationChargingActivityLabels = cfg.getDestinationChargingActivityLabels();
 		this.publicFastFallback = cfg.isPublicFastFallback();
+		this.mandatoryNearestPublicFast = cfg.isMandatoryNearestPublicFast();
 		this.latentPublicDemand = cfg.isLatentPublicDemand();
 		this.unrestrictedLatentPublicDemand = cfg.isUnrestrictedLatentPublicDemand();
 		this.realizePublicCharging = cfg.isRealizePublicCharging();
@@ -167,6 +169,19 @@ public final class FutureChargingBehaviourModel {
 
 	public boolean isUnrestrictedLatentPublicDemand() {
 		return unrestrictedLatentPublicDemand;
+	}
+
+	public boolean isMandatoryNearestPublicFast() {
+		return mandatoryNearestPublicFast;
+	}
+
+	/** Nearest public fast-charging candidate to the given coordinate, irrespective of distance (null if none). */
+	public Coord getNearestLatentPublicFastCandidate(Coord coord) {
+		if (latentPublicFastCandidateIndex == null || coord == null || !Double.isFinite(coord.getX())
+				|| !Double.isFinite(coord.getY())) {
+			return null;
+		}
+		return latentPublicFastCandidateIndex.getClosest(coord.getX(), coord.getY());
 	}
 
 	public boolean isRealizePublicCharging() {

@@ -32,6 +32,7 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	private boolean destinationChargingAvailable = false;
 	private String destinationChargingActivityTypes = DEFAULT_DESTINATION_CHARGING_ACTIVITY_TYPES;
 	private boolean publicFastFallback = true;
+	private boolean mandatoryNearestPublicFast = false;
 	private boolean latentPublicDemand = false;
 	private boolean unrestrictedLatentPublicDemand = false;
 	private boolean realizePublicCharging = false;
@@ -215,6 +216,21 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	@StringSetter("publicFastFallback")
 	public void setPublicFastFallback(boolean publicFastFallback) {
 		this.publicFastFallback = publicFastFallback;
+	}
+
+	/**
+	 * Paper 3 (2026-11-05): when a latent mandatory charge is triggered (SoC below the minimum SoC or the next EV
+	 * trip cannot be completed), the vehicle charges at the nearest public fast-charging candidate, irrespective of
+	 * distance, up to the public fast-charging target SoC. Evaluated at every activity start with the actual SoC.
+	 */
+	@StringGetter("mandatoryNearestPublicFast")
+	public boolean isMandatoryNearestPublicFast() {
+		return mandatoryNearestPublicFast;
+	}
+
+	@StringSetter("mandatoryNearestPublicFast")
+	public void setMandatoryNearestPublicFast(boolean mandatoryNearestPublicFast) {
+		this.mandatoryNearestPublicFast = mandatoryNearestPublicFast;
 	}
 
 	@StringGetter("latentPublicDemand")
