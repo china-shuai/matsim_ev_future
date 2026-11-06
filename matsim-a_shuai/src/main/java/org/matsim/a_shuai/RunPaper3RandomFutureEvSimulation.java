@@ -12,6 +12,6 @@ public class RunPaper3RandomFutureEvSimulation {
 	public static void main(String[] args) {
 		String config = args.length > 0 ? args[0] : DEFAULT_CONFIG;
 		String output = args.length > 1 ? args[1] : DEFAULT_OUTPUT;
-		RunFutureEvChargingBehaviourSimulation.main(new String[] { config, output });
+		RunFutureEvChargingBehaviourSimulation.main(args.length > 2 ? new String[] { config, output, args[2] } : new String[] { config, output });
 	}
 }

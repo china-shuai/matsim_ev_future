@@ -61,7 +61,14 @@ public class RunFutureEvChargingBehaviourSimulation {
 		addModule(controler, "org.matsim.contrib.ev.behavior.FutureChargingBehaviourModule");
 		addModule(controler, "org.matsim.contrib.ev.strategic.StrategicChargingModule");
 
-		controler.run();
+        if (args.length > 2 && "--audit-exposure-only".equals(args[2])) {
+            var cfg=ConfigUtils.addOrGetModule(config, org.matsim.contrib.ev.behavior.FutureChargingBehaviourConfigGroup.class);
+            if (!cfg.isAutomaticHomeExposure()) throw new IllegalArgumentException("Audit requires automaticHomeExposure=true");
+            controler.getInjector().getInstance(org.matsim.core.controler.PrepareForSim.class).run();
+            System.out.println("PAPER3_EXPOSURE_AUDIT_COMPLETE: no iterations or mobsim executed");
+            return;
+        }
+        controler.run();
 	}
 
 	private static ConfigGroup createConfigGroup(String className) {

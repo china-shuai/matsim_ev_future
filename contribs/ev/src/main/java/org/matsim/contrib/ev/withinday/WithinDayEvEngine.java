@@ -1902,107 +1902,22 @@ public class WithinDayEvEngine implements MobsimEngine, ActivityStartEventHandle
 	}
 
 	private EnumSet<FutureChargingSupplyType> createLatentFeasibleSupplyTypesForDuration(Plan plan, Activity activity,
-			FutureChargingActivityLabel label, boolean hasHomeCharger, boolean mandatory, double soc,
-			double activityDuration) {
-		if (futureChargingBehaviourModel == null) {
-			return EnumSet.noneOf(FutureChargingSupplyType.class);
-		}
-		if (label == FutureChargingActivityLabel.HOME) {
-			if (hasHomeCharger) {
-				return EnumSet.noneOf(FutureChargingSupplyType.class);
-			}
-			boolean fastLocationEligible = mandatory
-					|| futureChargingBehaviourModel.hasLatentPublicFastCandidateNear(
-							PopulationUtils.decideOnCoordForActivity(activity, scenario));
-			boolean fastSocEligible = mandatory || !Double.isFinite(soc)
-					|| soc <= futureChargingBehaviourModel.getMaximumLatentPublicFastSoc();
-			boolean fastEligible = mandatory || (fastLocationEligible && fastSocEligible
-					&& activityDuration >= futureChargingBehaviourModel.getMinimumLatentFastChargingDuration());
-			return fastEligible ? EnumSet.of(FutureChargingSupplyType.FAST)
-					: EnumSet.noneOf(FutureChargingSupplyType.class);
-		}
-		boolean fastLocationEligible = mandatory
-				|| futureChargingBehaviourModel.hasLatentPublicFastCandidateNear(
-						PopulationUtils.decideOnCoordForActivity(activity, scenario));
-		boolean fastSocEligible = mandatory || !Double.isFinite(soc)
-				|| soc <= futureChargingBehaviourModel.getMaximumLatentPublicFastSoc();
-		boolean fastEligible = mandatory || (fastLocationEligible && fastSocEligible
-				&& activityDuration >= futureChargingBehaviourModel.getMinimumLatentFastChargingDuration());
-		boolean activityChargingEligible = activityDuration >= futureChargingBehaviourModel
-				.getMinimumLatentActivityChargingDuration();
-		EnumSet<FutureChargingSupplyType> feasible = EnumSet.noneOf(FutureChargingSupplyType.class);
-		if (futureChargingBehaviourModel.isUnrestrictedLatentPublicDemand()) {
-			if (fastEligible) {
-				feasible.add(FutureChargingSupplyType.FAST);
-			}
-		} else {
-			feasible = futureChargingBehaviourModel.createFeasiblePublicSupplyTypes(label, hasHomeCharger, mandatory);
-			if (!fastEligible) {
-				feasible.remove(FutureChargingSupplyType.FAST);
-			}
-		}
-		if (mandatory && feasible.isEmpty()) {
-			feasible.add(FutureChargingSupplyType.FAST);
-		}
-
-		if (activityChargingEligible && label == FutureChargingActivityLabel.WORK && hasLatentService(plan, activity,
-				FutureChargingSupplyType.WORKPLACE, futureChargingBehaviourModel.getLatentWorkplaceServiceRate())) {
-			feasible.add(FutureChargingSupplyType.WORKPLACE);
-		}
-		if (activityChargingEligible && futureChargingBehaviourModel.isDestinationChargingActivity(label)
-				&& hasLatentService(plan, activity, FutureChargingSupplyType.DESTINATION,
-						futureChargingBehaviourModel.getLatentDestinationServiceRate())) {
-			feasible.add(FutureChargingSupplyType.DESTINATION);
-		}
-		return feasible;
-	}
+            FutureChargingActivityLabel label, boolean hasHomeCharger, boolean mandatory, double soc,
+            double activityDuration) {
+        if (futureChargingBehaviourModel == null || (label == FutureChargingActivityLabel.HOME && hasHomeCharger))
+            return EnumSet.noneOf(FutureChargingSupplyType.class);
+        return FutureChargingOpportunityRules.feasible(futureChargingBehaviourModel, label, hasHomeCharger,
+            mandatory, soc, activityDuration,
+            mandatory || futureChargingBehaviourModel.hasLatentPublicFastCandidateNear(PopulationUtils.decideOnCoordForActivity(activity, scenario)),
+            activityDuration >= futureChargingBehaviourModel.getMinimumLatentActivityChargingDuration() && label == FutureChargingActivityLabel.WORK
+                && hasLatentService(plan, activity, FutureChargingSupplyType.WORKPLACE, futureChargingBehaviourModel.getLatentWorkplaceServiceRate()),
+            activityDuration >= futureChargingBehaviourModel.getMinimumLatentActivityChargingDuration() && futureChargingBehaviourModel.isDestinationChargingActivity(label)
+                && hasLatentService(plan, activity, FutureChargingSupplyType.DESTINATION, futureChargingBehaviourModel.getLatentDestinationServiceRate()));
+    }
 
 	private Map<Activity, Double> estimateActivityDurations(Plan plan) {
-		if (plan == null) {
-			return Collections.emptyMap();
-		}
-
-		Map<Activity, Double> durations = new IdentityHashMap<>();
-		double currentTime = 0.0;
-		Activity finalActivity = findFinalActivity(plan);
-		double overnightEnd = Double.NaN;
-		if (!plan.getPlanElements().isEmpty() && plan.getPlanElements().get(0) instanceof Activity first
-				&& first.getEndTime().isDefined() && Double.isFinite(first.getEndTime().seconds())) {
-			overnightEnd = first.getEndTime().seconds() + SECONDS_PER_DAY;
-		}
-		for (PlanElement element : plan.getPlanElements()) {
-			if (element instanceof Activity activity) {
-				double startTime = activity.getStartTime().isDefined() ? activity.getStartTime().seconds()
-						: currentTime;
-				double endTime = Double.NaN;
-				if (activity == finalActivity && Double.isFinite(overnightEnd)) {
-					// Paper 3 fix (2026-11-05): the final activity lasts overnight until the first departure of the
-					// next day; its artificial 23:30-24:00 end time in the input plans is ignored.
-					endTime = Math.max(overnightEnd, Math.max(startTime, currentTime));
-				} else if (activity.getEndTime().isDefined()) {
-					endTime = activity.getEndTime().seconds();
-				} else if (activity.getMaximumDuration().isDefined()) {
-					endTime = startTime + activity.getMaximumDuration().seconds();
-				}
-				if (Double.isFinite(endTime)) {
-					durations.put(activity, Math.max(0.0, endTime - startTime));
-					currentTime = Math.max(currentTime, endTime);
-				} else {
-					durations.put(activity, 0.0);
-					currentTime = Math.max(currentTime, startTime);
-				}
-			} else if (element instanceof Leg leg) {
-				double departureTime = leg.getDepartureTime().isDefined() ? leg.getDepartureTime().seconds()
-						: currentTime;
-				currentTime = Math.max(currentTime, departureTime);
-				double travelTime = estimateLegTravelTime(leg);
-				if (Double.isFinite(travelTime) && travelTime > 0.0) {
-					currentTime += travelTime;
-				}
-			}
-		}
-		return durations;
-	}
+        return FutureChargingOpportunityRules.activityDurations(plan);
+    }
 
 	private Activity findFinalActivity(Plan plan) {
 		if (plan == null) {

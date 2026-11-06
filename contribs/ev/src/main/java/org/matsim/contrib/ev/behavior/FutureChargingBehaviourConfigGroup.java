@@ -12,6 +12,12 @@ import org.matsim.core.config.ReflectiveConfigGroup;
  * Config group for the Paper 3 sequential H/W/D/F charging model.
  */
 public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
+    private boolean automaticHomeExposure = false;
+    @StringGetter("automaticHomeExposure")
+    public boolean isAutomaticHomeExposure() { return automaticHomeExposure; }
+    @StringSetter("automaticHomeExposure")
+    public void setAutomaticHomeExposure(boolean value) { automaticHomeExposure=value; }
+
 	public static final String GROUP_NAME = "futureChargingBehaviour";
 	public static final String DEFAULT_DESTINATION_CHARGING_ACTIVITY_TYPES = "Shop,Social/Recreational,Personal";
 
