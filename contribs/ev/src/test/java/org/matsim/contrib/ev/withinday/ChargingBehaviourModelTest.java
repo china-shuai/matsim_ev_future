@@ -15,10 +15,15 @@ import org.matsim.contrib.ev.behavior.GroupType;
 import org.matsim.contrib.ev.behavior.LegacyChargingDecisionStrategy;
 import org.matsim.contrib.ev.behavior.LocationType;
 import org.matsim.contrib.ev.behavior.TimeBand;
+import org.matsim.contrib.ev.fleet.ElectricVehicle;
+import org.matsim.contrib.ev.infrastructure.Charger;
+import org.matsim.contrib.ev.infrastructure.ChargingInfrastructure;
 import org.matsim.contrib.ev.withinday.utils.WorkActivitySlotProvider;
 import org.matsim.core.controler.AbstractModule;
 import org.matsim.core.mobsim.qsim.AbstractQSimModule;
 import org.matsim.testcases.MatsimTestUtils;
+
+import com.google.inject.Inject;
 
 /**
  * Minimal integration test verifying that the charging behaviour model steers
@@ -108,5 +113,69 @@ public class ChargingBehaviourModelTest {
 		org.junit.jupiter.api.Assertions.assertTrue(
 				behaviourModel.computeChargingProbability(testAgent, testActivity) > 0.9,
 				"Probability should exceed 0.9 for high sensitivity settings.");
+	}
+
+	@Test
+	public void testLegacyStrategyStillLimitsChargingToOncePerDayWithoutFutureModel() {
+		var builder = new org.matsim.contrib.ev.strategic.utils.TestScenarioBuilder(utils);
+
+		builder.setElectricVehicleRange(1_000_000.0);
+		builder.addCharger("charger", 3, 3, 1, 1.0);
+		builder.addPerson("person", 0.1)
+				.addActivity("home", 0, 0, 8.0 * 3600.0)
+				.addActivity("work", 3, 3, 9.0 * 3600.0)
+				.addActivity("home", 0, 0, 10.0 * 3600.0)
+				.addActivity("work", 3, 3, 11.0 * 3600.0)
+				.addActivity("home", 0, 0);
+
+		var scenario = builder.build();
+		var person = scenario.scenario().getPopulation().getPersons().get(Id.createPersonId("person"));
+		person.getAttributes().putAttribute(WithinDayEvEngine.DWELLING_TYPE_ATTRIBUTE, "apartment");
+		person.getAttributes().putAttribute(WithinDayEvEngine.HOME_CHARGER_ATTRIBUTE, false);
+
+		var behaviourModel = new ChargingBehaviourModel();
+		var controler = scenario.controller();
+		controler.addOverridingModule(new AbstractModule() {
+			@Override
+			public void install() {
+				bind(ChargingBehaviourModel.class).toInstance(behaviourModel);
+			}
+		});
+		controler.addOverridingQSimModule(new AbstractQSimModule() {
+			@Override
+			protected void configureQSim() {
+				bind(ChargingSlotProvider.class).to(TwoWorkActivitySlotProvider.class);
+				bind(ChargingDecisionStrategy.class).to(LegacyChargingDecisionStrategy.class);
+			}
+		});
+
+		controler.run();
+
+		var tracker = scenario.tracker();
+		assertEquals(1, tracker.startChargingProcessEvents.size(),
+				"The legacy strategy must keep its one-charge-per-day behaviour with multiple eligible slots.");
+		assertEquals(1, tracker.finishChargingProcessEvents.size());
+	}
+
+	private static final class TwoWorkActivitySlotProvider implements ChargingSlotProvider {
+		private final Charger charger;
+
+		@Inject
+		TwoWorkActivitySlotProvider(ChargingInfrastructure infrastructure) {
+			this.charger = infrastructure.getChargers().values().stream().findFirst().orElseThrow();
+		}
+
+		@Override
+		public List<ChargingSlot> findSlots(org.matsim.api.core.v01.population.Person person,
+				org.matsim.api.core.v01.population.Plan plan, ElectricVehicle vehicle) {
+			List<ChargingSlot> slots = new java.util.ArrayList<>();
+			for (var element : plan.getPlanElements()) {
+				if (element instanceof org.matsim.api.core.v01.population.Activity activity
+						&& "work".equals(activity.getType())) {
+					slots.add(new ChargingSlot(activity, activity, charger));
+				}
+			}
+			return slots;
+		}
 	}
 }

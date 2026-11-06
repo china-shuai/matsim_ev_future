@@ -20,12 +20,15 @@ import org.matsim.contrib.ev.behavior.FutureChargingBehaviourParameters;
 import org.matsim.contrib.ev.behavior.FutureChargingDecisionStrategy;
 import org.matsim.contrib.ev.behavior.FutureChargingSupplyType;
 import org.matsim.contrib.ev.behavior.GroupType;
+import org.matsim.contrib.ev.behavior.TimeBand;
 import org.matsim.contrib.ev.fleet.ElectricVehicle;
 import org.matsim.contrib.ev.infrastructure.Charger;
 import org.matsim.contrib.ev.infrastructure.ChargingInfrastructure;
 import org.matsim.contrib.ev.strategic.utils.TestScenarioBuilder;
 import org.matsim.contrib.ev.strategic.utils.TestScenarioBuilder.TestScenario;
+import org.matsim.contrib.ev.withinday.events.RealizedPublicChargingEvent;
 import org.matsim.core.controler.AbstractModule;
+import org.matsim.core.events.handler.BasicEventHandler;
 import org.matsim.core.mobsim.qsim.AbstractQSimModule;
 import org.matsim.testcases.MatsimTestUtils;
 
@@ -234,6 +237,112 @@ public class FutureChargingActivitySelectionTest {
 		assertTrue(record.socAfterCharging() > record.soc());
 	}
 
+	@Test
+	public void testRealizedPublicChargingUpdatesSocAndCanOccurMoreThanOncePerDay() {
+		TestRun run = runFutureScenario(false, 0.4, 0.0, MiddayHomeSlotProvider.class,
+				"car", "car", "car", true, false);
+
+		var records = run.model().consumeLatentPublicDemandRecords();
+		assertTrue(records.size() >= 2,
+				"Disabling the once-per-day limit must allow charging followed by a new selection.");
+		assertEquals(records.size(), run.realizedPublicChargingEvents().size());
+		assertTrue(records.stream().allMatch(FutureChargingBehaviourModel.LatentPublicDemandRecord::socUpdated));
+		assertTrue(records.stream().allMatch(record -> record.chargedEnergy() > 0.0));
+		assertTrue(records.stream().allMatch(record ->
+				Math.abs(record.energyDemand() - record.chargedEnergy()) < 1e-9));
+		assertTrue(run.realizedPublicChargingEvents().stream().allMatch(event -> event.getEnergy() > 0.0));
+		assertTrue(run.realizedPublicChargingEvents().stream().allMatch(event -> event.getSocAfter() > event.getSocBefore()));
+	}
+
+	@Test
+	public void testConditionalPublicFastChargingStopsAtConfiguredTargetSoc() {
+		TestRun run = runFutureScenario(false, 0.4, 0.0, MiddayHomeSlotProvider.class,
+				"car", "car", "car", true, true, 0.8);
+
+		var records = run.model().consumeLatentPublicDemandRecords();
+		assertEquals(1, records.size());
+		var record = records.getFirst();
+		assertFalse(record.mandatory());
+		assertEquals(FutureChargingSupplyType.FAST, record.supplyType());
+		assertEquals(0.8, record.targetSoc(), 1e-9);
+		assertEquals(0.8, record.socAfterCharging(), 1e-9,
+				"A sufficiently long conditional PFC stop must stop at the configured 80% target.");
+	}
+
+	@Test
+	public void testDynamicSelectionSkipsIntermediateActivityAndReselectsAfterSocUpdate() {
+		TestScenario scenario = new TestScenarioBuilder(utils)
+				.setElectricVehicleRange(100_000.0)
+				.addHomeCharger("person", 0, 0, 1, 1.0, "default")
+				.addPerson("person", 0.4)
+				.addActivity("home", 0, 0, 8.0 * 3600.0)
+				.addActivity("work", 3, 3, 9.5 * 3600.0)
+				.addActivity("work", 4, 4, 15.5 * 3600.0)
+				.addActivity("work", 5, 5, 20.0 * 3600.0)
+				.addActivity("home", 0, 0)
+				.build();
+
+		var person = scenario.scenario().getPopulation().getPersons().get(Id.createPersonId("person"));
+		person.getAttributes().putAttribute(WithinDayEvEngine.DWELLING_TYPE_ATTRIBUTE, "house_with_pv");
+		person.getAttributes().putAttribute(WithinDayEvEngine.HOME_CHARGER_ATTRIBUTE, true);
+
+		FutureChargingBehaviourConfigGroup cfg = new FutureChargingBehaviourConfigGroup();
+		cfg.setLatentPublicDemand(true);
+		cfg.setUnrestrictedLatentPublicDemand(true);
+		cfg.setMinimumSoc(0.0);
+		cfg.setMinimumLatentFastChargingDuration(0.0);
+		cfg.setMaximumLatentPublicFastSoc(1.0);
+		cfg.setRealizePublicCharging(true);
+		cfg.setLimitChargingToOncePerDay(false);
+		cfg.setActivitySelectionTemperature(0.0);
+
+		FutureChargingBehaviourParameters parameters = FutureChargingBehaviourParameters.createDefault();
+		var group = parameters.getGroupParameters(GroupType.HOUSE_WITH_PV);
+		group.setRealFrequency(0.999);
+		group.setLambda(0.0);
+		group.setRhoHome(-30.0);
+		group.setRhoAway(0.0);
+		group.setTimePreference(TimeBand.MORNING_6_10, 20.0);
+		group.setTimePreference(TimeBand.MIDDAY_10_16, 10.0);
+		group.setTimePreference(TimeBand.EVENING_16_22, 15.0);
+		group.setTimePreference(TimeBand.NIGHT_22_6, -30.0);
+
+		FutureChargingBehaviourModel model = new FutureChargingBehaviourModel(cfg, parameters);
+		List<RealizedPublicChargingEvent> realizedEvents = new ArrayList<>();
+		BasicEventHandler handler = event -> {
+			if (event instanceof RealizedPublicChargingEvent realizedEvent) {
+				realizedEvents.add(realizedEvent);
+			}
+		};
+		var controler = scenario.controller();
+		controler.addOverridingModule(new AbstractModule() {
+			@Override
+			public void install() {
+				bind(FutureChargingBehaviourModel.class).toInstance(model);
+				addEventHandlerBinding().toInstance(handler);
+			}
+		});
+		controler.addOverridingQSimModule(new AbstractQSimModule() {
+			@Override
+			protected void configureQSim() {
+				bind(ChargingSlotProvider.class).to(NoPreplannedSlotProvider.class);
+				bind(ChargingDecisionStrategy.class).toInstance(new FutureChargingDecisionStrategy(model));
+			}
+		});
+
+		controler.run();
+
+		var records = model.consumeLatentPublicDemandRecords();
+		assertEquals(2, records.size(),
+				"Only the preferred morning activity and the activity selected after charging may realize demand.");
+		assertTrue(records.get(1).time() > 15.5 * 3600.0,
+				"The attractive intermediate opportunity must be skipped while the later activity is preferred.");
+		assertTrue(records.get(1).time() > records.get(0).time());
+		assertTrue(records.get(1).soc() > records.get(0).soc(),
+				"The second selection must use the battery SOC resulting from the first realized charge.");
+		assertEquals(2, realizedEvents.size());
+	}
+
 	private TestRun runFutureScenario(boolean preferHome) {
 		return runFutureScenario(preferHome, 0.8, 0.0);
 	}
@@ -256,6 +365,21 @@ public class FutureChargingActivitySelectionTest {
 	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
 			Class<? extends ChargingSlotProvider> slotProviderClass, String firstWorkMode, String homeMode,
 			String secondWorkMode) {
+		return runFutureScenario(preferHome, initialSoc, minimumSoc, slotProviderClass, firstWorkMode, homeMode,
+				secondWorkMode, false, true);
+	}
+
+	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
+			Class<? extends ChargingSlotProvider> slotProviderClass, String firstWorkMode, String homeMode,
+			String secondWorkMode, boolean realizePublicCharging, boolean limitChargingToOncePerDay) {
+		return runFutureScenario(preferHome, initialSoc, minimumSoc, slotProviderClass, firstWorkMode, homeMode,
+				secondWorkMode, realizePublicCharging, limitChargingToOncePerDay, 1.0);
+	}
+
+	private TestRun runFutureScenario(boolean preferHome, double initialSoc, double minimumSoc,
+			Class<? extends ChargingSlotProvider> slotProviderClass, String firstWorkMode, String homeMode,
+			String secondWorkMode, boolean realizePublicCharging, boolean limitChargingToOncePerDay,
+			double latentPublicFastTargetSoc) {
 		TestScenario scenario = new TestScenarioBuilder(utils)
 				.setElectricVehicleRange(100_000.0)
 				.addHomeCharger("person", 0, 0, 1, 1.0, "default")
@@ -276,6 +400,9 @@ public class FutureChargingActivitySelectionTest {
 		cfg.setMinimumSoc(minimumSoc);
 		cfg.setMinimumLatentFastChargingDuration(0.0);
 		cfg.setMaximumLatentPublicFastSoc(1.0);
+		cfg.setLatentPublicFastTargetSoc(latentPublicFastTargetSoc);
+		cfg.setRealizePublicCharging(realizePublicCharging);
+		cfg.setLimitChargingToOncePerDay(limitChargingToOncePerDay);
 
 		FutureChargingBehaviourParameters parameters = FutureChargingBehaviourParameters.createDefault();
 		var group = parameters.getGroupParameters(GroupType.HOUSE_WITH_PV);
@@ -285,11 +412,18 @@ public class FutureChargingActivitySelectionTest {
 		group.setRhoAway(preferHome ? -30.0 : 30.0);
 
 		FutureChargingBehaviourModel model = new FutureChargingBehaviourModel(cfg, parameters);
+		List<RealizedPublicChargingEvent> realizedPublicChargingEvents = new ArrayList<>();
+		BasicEventHandler realizedPublicChargingHandler = event -> {
+			if (event instanceof RealizedPublicChargingEvent realizedPublicChargingEvent) {
+				realizedPublicChargingEvents.add(realizedPublicChargingEvent);
+			}
+		};
 		var controler = scenario.controller();
 		controler.addOverridingModule(new AbstractModule() {
 			@Override
 			public void install() {
 				bind(FutureChargingBehaviourModel.class).toInstance(model);
+				addEventHandlerBinding().toInstance(realizedPublicChargingHandler);
 			}
 		});
 		controler.addOverridingQSimModule(new AbstractQSimModule() {
@@ -301,10 +435,11 @@ public class FutureChargingActivitySelectionTest {
 		});
 
 		controler.run();
-		return new TestRun(scenario, model);
+		return new TestRun(scenario, model, realizedPublicChargingEvents);
 	}
 
-	private record TestRun(TestScenario scenario, FutureChargingBehaviourModel model) {
+	private record TestRun(TestScenario scenario, FutureChargingBehaviourModel model,
+			List<RealizedPublicChargingEvent> realizedPublicChargingEvents) {
 	}
 
 	private static final class MiddayHomeSlotProvider implements ChargingSlotProvider {

@@ -27,6 +27,8 @@ import com.google.inject.Singleton;
 public class FutureChargingBehaviourModule extends AbstractModule {
 	@Override
 	public void install() {
+        if (ConfigUtils.addOrGetModule(getConfig(), FutureChargingBehaviourConfigGroup.class).isAutomaticHomeExposure())
+            install(new FutureChargingAutoExposureModule());
 		bind(FutureChargingBehaviourModel.class).toProvider(FutureChargingBehaviourModelProvider.class).in(Singleton.class);
 		bind(ChargingDecisionStrategy.class).to(FutureChargingDecisionStrategy.class).in(Singleton.class);
 		addControllerListenerBinding().to(FutureChargingBehaviourCalibrationListener.class).in(Singleton.class);
@@ -248,12 +250,13 @@ public class FutureChargingBehaviourModule extends AbstractModule {
 					double nHome = Double.parseDouble(tokens[1].trim());
 					double nDest = Double.parseDouble(tokens[2].trim());
 					double nFast = Double.parseDouble(tokens[3].trim());
-					double eHome = Double.parseDouble(tokens[4].trim());
-					double eAway = Double.parseDouble(tokens[5].trim());
+					boolean automatic = ConfigUtils.addOrGetModule(config, FutureChargingBehaviourConfigGroup.class).isAutomaticHomeExposure();
+                    double eHome = automatic ? Double.NaN : Double.parseDouble(tokens[4].trim());
+					double eAway = automatic ? Double.NaN : Double.parseDouble(tokens[5].trim());
 					if (tokens.length >= 7) {
 						parameters.getGroupParameters(group).setRealFrequency(Double.parseDouble(tokens[6].trim()));
 					}
-					applyHomePreferences(parameters.getGroupParameters(group), nHome, nDest, nFast, eHome, eAway);
+					if (!automatic) applyHomePreferences(parameters.getGroupParameters(group), nHome, nDest, nFast, eHome, eAway);
 				}
 			} catch (IOException e) {
 				throw new RuntimeException("Failed to read future charging location preferences from " + url, e);

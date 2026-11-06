@@ -12,6 +12,12 @@ import org.matsim.core.config.ReflectiveConfigGroup;
  * Config group for the Paper 3 sequential H/W/D/F charging model.
  */
 public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
+    private boolean automaticHomeExposure = false;
+    @StringGetter("automaticHomeExposure")
+    public boolean isAutomaticHomeExposure() { return automaticHomeExposure; }
+    @StringSetter("automaticHomeExposure")
+    public void setAutomaticHomeExposure(boolean value) { automaticHomeExposure=value; }
+
 	public static final String GROUP_NAME = "futureChargingBehaviour";
 	public static final String DEFAULT_DESTINATION_CHARGING_ACTIVITY_TYPES = "Shop,Social/Recreational,Personal";
 
@@ -32,13 +38,17 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	private boolean destinationChargingAvailable = false;
 	private String destinationChargingActivityTypes = DEFAULT_DESTINATION_CHARGING_ACTIVITY_TYPES;
 	private boolean publicFastFallback = true;
+	private boolean mandatoryNearestPublicFast = false;
 	private boolean latentPublicDemand = false;
 	private boolean unrestrictedLatentPublicDemand = false;
+	private boolean realizePublicCharging = false;
+	private boolean limitChargingToOncePerDay = true;
 	private double latentWorkplaceServiceRate = 0.0;
 	private double latentDestinationServiceRate = 0.0;
 	private double minimumLatentActivityChargingDuration = 1800.0;
 	private double minimumLatentFastChargingDuration = 900.0;
 	private double maximumLatentPublicFastSoc = 1.0;
+	private double latentPublicFastTargetSoc = 1.0;
 	private double publicStartSocWeightExponent = 0.0;
 	private String latentPublicDemandFile = "futureChargingLatentPublicDemand.csv";
 	private String timePreferenceFile;
@@ -214,6 +224,21 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 		this.publicFastFallback = publicFastFallback;
 	}
 
+	/**
+	 * Paper 3 (2026-11-05): when a latent mandatory charge is triggered (SoC below the minimum SoC or the next EV
+	 * trip cannot be completed), the vehicle charges at the nearest public fast-charging candidate, irrespective of
+	 * distance, up to the public fast-charging target SoC. Evaluated at every activity start with the actual SoC.
+	 */
+	@StringGetter("mandatoryNearestPublicFast")
+	public boolean isMandatoryNearestPublicFast() {
+		return mandatoryNearestPublicFast;
+	}
+
+	@StringSetter("mandatoryNearestPublicFast")
+	public void setMandatoryNearestPublicFast(boolean mandatoryNearestPublicFast) {
+		this.mandatoryNearestPublicFast = mandatoryNearestPublicFast;
+	}
+
 	@StringGetter("latentPublicDemand")
 	public boolean isLatentPublicDemand() {
 		return latentPublicDemand;
@@ -232,6 +257,26 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	@StringSetter("unrestrictedLatentPublicDemand")
 	public void setUnrestrictedLatentPublicDemand(boolean unrestrictedLatentPublicDemand) {
 		this.unrestrictedLatentPublicDemand = unrestrictedLatentPublicDemand;
+	}
+
+	@StringGetter("realizePublicCharging")
+	public boolean isRealizePublicCharging() {
+		return realizePublicCharging;
+	}
+
+	@StringSetter("realizePublicCharging")
+	public void setRealizePublicCharging(boolean realizePublicCharging) {
+		this.realizePublicCharging = realizePublicCharging;
+	}
+
+	@StringGetter("limitChargingToOncePerDay")
+	public boolean isLimitChargingToOncePerDay() {
+		return limitChargingToOncePerDay;
+	}
+
+	@StringSetter("limitChargingToOncePerDay")
+	public void setLimitChargingToOncePerDay(boolean limitChargingToOncePerDay) {
+		this.limitChargingToOncePerDay = limitChargingToOncePerDay;
 	}
 
 	@StringGetter("latentWorkplaceServiceRate")
@@ -282,6 +327,21 @@ public class FutureChargingBehaviourConfigGroup extends ReflectiveConfigGroup {
 	@StringSetter("maximumLatentPublicFastSoc")
 	public void setMaximumLatentPublicFastSoc(double maximumLatentPublicFastSoc) {
 		this.maximumLatentPublicFastSoc = clip01(maximumLatentPublicFastSoc);
+	}
+
+	/**
+	 * Target state of charge for conditional public fast charging. Mandatory
+	 * charging may exceed this target when the next EV trip plus the configured
+	 * minimum-SOC reserve requires it.
+	 */
+	@StringGetter("latentPublicFastTargetSoc")
+	public double getLatentPublicFastTargetSoc() {
+		return latentPublicFastTargetSoc;
+	}
+
+	@StringSetter("latentPublicFastTargetSoc")
+	public void setLatentPublicFastTargetSoc(double latentPublicFastTargetSoc) {
+		this.latentPublicFastTargetSoc = clip01(latentPublicFastTargetSoc);
 	}
 
 	@StringGetter("publicStartSocWeightExponent")

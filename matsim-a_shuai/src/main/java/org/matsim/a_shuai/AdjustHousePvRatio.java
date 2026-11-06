@@ -25,6 +25,9 @@ import java.util.Random;
  *   java org.matsim.a_shuai.AdjustHousePvRatio <population_in> <population_out> <target_pv_ratio>
  * 若省略参数使用默认路径和比例。
  * 可通过 JVM -Dev.house.pvRatio=0.6 设定目标比例（覆盖命令行/默认）。
+ *
+ * 注意：Paper 2 / Paper 3 的正式输入已改用按 postcode 分配的 PV（APVI 空间权重，85%），
+ * 见 matsim-a_shuai/tools/regional_pv/。本类的随机分配仅保留用于旧实验复现。
  */
 public class AdjustHousePvRatio {
 

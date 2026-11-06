@@ -109,7 +109,7 @@ public final class FutureChargingBehaviourCalibrationListener implements Iterati
 					.setHeader("iteration", "personId", "vehicleId", "group", "activityLabel", "activityType", "linkId",
 							"time", "timeBand", "soc", "probability", "mandatory", "supplyType", "opportunityValue",
 							"demandType", "socUpdated", "demandDuration", "energyDemand", "chargingDuration",
-							"chargedEnergy", "socAfterCharging")
+							"chargedEnergy", "targetSoc", "socAfterCharging")
 					.build();
 
 		try (CSVPrinter printer = new CSVPrinter(Files.newBufferedWriter(Paths.get(file)), format)) {
@@ -119,7 +119,7 @@ public final class FutureChargingBehaviourCalibrationListener implements Iterati
 							record.timeBand().name(), record.soc(), record.probability(), record.mandatory(),
 							record.supplyType().name(), record.opportunityValue(), record.demandType(),
 							record.socUpdated(), record.demandDuration(), record.energyDemand(), record.chargingDuration(),
-							record.chargedEnergy(), record.socAfterCharging());
+							record.chargedEnergy(), record.targetSoc(), record.socAfterCharging());
 				}
 		} catch (IOException e) {
 			throw new RuntimeException("Failed to write future latent public charging demand to " + file, e);
